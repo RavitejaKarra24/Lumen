@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
+# Build, bundle, and sign Lumen without requiring an Xcode project.
 set -euo pipefail
 
 CONF=${1:-release}
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-
-APP_NAME=${APP_NAME:-MyApp}
-BUNDLE_ID=${BUNDLE_ID:-com.example.myapp}
-MACOS_MIN_VERSION=${MACOS_MIN_VERSION:-14.0}
-MENU_BAR_APP=${MENU_BAR_APP:-0}
-SIGNING_MODE=${SIGNING_MODE:-local}
-APP_IDENTITY=${APP_IDENTITY:-}
-APP_KEYCHAIN=${APP_KEYCHAIN:-}
-APP_KEYCHAIN_PASSWORD_FILE=${APP_KEYCHAIN_PASSWORD_FILE:-}
+source "$ROOT/app.env"
 
 if [[ -f "$ROOT/version.env" ]]; then
   source "$ROOT/version.env"
@@ -21,34 +14,66 @@ else
   BUILD_NUMBER=${BUILD_NUMBER:-1}
 fi
 
-ARCH_LIST=( ${ARCHES:-} )
-if [[ ${#ARCH_LIST[@]} -eq 0 ]]; then
-  HOST_ARCH=$(uname -m)
-  ARCH_LIST=("$HOST_ARCH")
-fi
-
-for ARCH in "${ARCH_LIST[@]}"; do
-  swift build -c "$CONF" --arch "$ARCH"
+for tool in swift lipo codesign plutil xattr; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "ERROR: $tool is required. Install Xcode Command Line Tools with: xcode-select --install" >&2
+    exit 1
+  }
 done
 
-APP="$ROOT/${APP_NAME}.app"
+ARCH_LIST=( ${ARCHES:-} )
+if [[ ${#ARCH_LIST[@]} -eq 0 ]]; then
+  ARCH_LIST=("$(uname -m)")
+fi
+
+# Newer standalone toolchains can use Swift Build when the native engine is
+# unavailable. Older toolchains simply omit this optional flag.
+BUILD_SYSTEM_ARGS=()
+if [[ -n ${SWIFT_BUILD_SYSTEM:-} ]]; then
+  BUILD_SYSTEM_ARGS=(--build-system "$SWIFT_BUILD_SYSTEM")
+elif swift build --help 2>/dev/null | grep -q "swiftbuild"; then
+  BUILD_SYSTEM_ARGS=(--build-system swiftbuild)
+fi
+
+BINARIES=()
+BUNDLE_SEARCH_DIRS=()
+for arch in "${ARCH_LIST[@]}"; do
+  swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" --arch "$arch"
+  bin_dir="$(swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" --arch "$arch" --show-bin-path)"
+  binary="$bin_dir/$APP_NAME"
+  if [[ ! -f "$binary" ]]; then
+    echo "ERROR: Missing $APP_NAME build for $arch at $binary" >&2
+    exit 1
+  fi
+  BINARIES+=("$binary")
+  BUNDLE_SEARCH_DIRS+=("$bin_dir")
+done
+
+APP="$ROOT/$APP_NAME.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
-# Convert Icon.icon to Icon.icns if present (requires iconutil).
-ICON_SOURCE="$ROOT/Icon.icon"
-ICON_TARGET="$ROOT/Icon.icns"
-if [[ -f "$ICON_SOURCE" ]]; then
-  iconutil --convert icns --output "$ICON_TARGET" "$ICON_SOURCE"
+if [[ ${#BINARIES[@]} -gt 1 ]]; then
+  lipo -create "${BINARIES[@]}" -output "$APP/Contents/MacOS/$APP_NAME"
+else
+  cp "${BINARIES[0]}" "$APP/Contents/MacOS/$APP_NAME"
 fi
+chmod +x "$APP/Contents/MacOS/$APP_NAME"
 
-LSUI_VALUE="false"
+actual_arches="$(lipo -archs "$APP/Contents/MacOS/$APP_NAME")"
+for arch in "${ARCH_LIST[@]}"; do
+  if [[ " $actual_arches " != *" $arch "* ]]; then
+    echo "ERROR: App binary is missing $arch (found: $actual_arches)" >&2
+    exit 1
+  fi
+done
+
+LSUI_VALUE=false
 if [[ "$MENU_BAR_APP" == "1" ]]; then
-  LSUI_VALUE="true"
+  LSUI_VALUE=true
 fi
-
-BUILD_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,163 +95,128 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-build_product_path() {
-  local name="$1"
-  local arch="$2"
-  case "$arch" in
-    arm64|x86_64) echo ".build/${arch}-apple-macosx/$CONF/$name" ;;
-    *) echo ".build/$CONF/$name" ;;
-  esac
-}
+copy_resource_bundle() {
+  local source="$1"
+  local name destination identifier
+  name="$(basename "$source")"
+  destination="$APP/Contents/Resources/$name"
 
-verify_binary_arches() {
-  local binary="$1"; shift
-  local expected=("$@")
-  local actual
-  actual=$(lipo -archs "$binary")
-  local actual_count expected_count
-  actual_count=$(wc -w <<<"$actual" | tr -d ' ')
-  expected_count=${#expected[@]}
-  if [[ "$actual_count" -ne "$expected_count" ]]; then
-    echo "ERROR: $binary arch mismatch (expected: ${expected[*]}, actual: ${actual})" >&2
-    exit 1
+  if [[ -f "$source/Contents/Info.plist" ]]; then
+    cp -R "$source" "$destination"
+    return
   fi
-  for arch in "${expected[@]}"; do
-    if [[ "$actual" != *"$arch"* ]]; then
-      echo "ERROR: $binary missing arch $arch (have: ${actual})" >&2
-      exit 1
-    fi
-  done
-}
 
-install_binary() {
-  local name="$1"
-  local dest="$2"
-  local binaries=()
-  for arch in "${ARCH_LIST[@]}"; do
-    local src
-    src=$(build_product_path "$name" "$arch")
-    if [[ ! -f "$src" ]]; then
-      echo "ERROR: Missing ${name} build for ${arch} at ${src}" >&2
-      exit 1
-    fi
-    binaries+=("$src")
-  done
-  if [[ ${#ARCH_LIST[@]} -gt 1 ]]; then
-    lipo -create "${binaries[@]}" -output "$dest"
+  # SwiftPM's native and Swift Build engines can emit flat resource bundles.
+  # Turn those into a standard macOS bundle before signing the outer app.
+  mkdir -p "$destination/Contents/Resources"
+  if [[ -d "$source/Resources" ]]; then
+    cp -R "$source/Resources/." "$destination/Contents/Resources/"
   else
-    cp "${binaries[0]}" "$dest"
+    cp -R "$source/." "$destination/Contents/Resources/"
   fi
-  chmod +x "$dest"
-  verify_binary_arches "$dest" "${ARCH_LIST[@]}"
+  identifier="${BUNDLE_ID}.resources.${name%.bundle}"
+  cat > "$destination/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>${identifier}</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
+</dict></plist>
+PLIST
 }
 
-install_binary "$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
-
-# Bundle app resources (if any).
-APP_RESOURCES_DIR="$ROOT/Sources/$APP_NAME/Resources"
-if [[ -d "$APP_RESOURCES_DIR" ]]; then
-  cp -R "$APP_RESOURCES_DIR/." "$APP/Contents/Resources/"
-fi
-
-# SwiftPM resource bundles are emitted next to the built binary.
-PREFERRED_BUILD_DIR="$(dirname "$(build_product_path "$APP_NAME" "${ARCH_LIST[0]}")")"
-shopt -s nullglob
-SWIFTPM_BUNDLES=("${PREFERRED_BUILD_DIR}/"*.bundle)
-shopt -u nullglob
-if [[ ${#SWIFTPM_BUNDLES[@]} -gt 0 ]]; then
-  for bundle in "${SWIFTPM_BUNDLES[@]}"; do
-    cp -R "$bundle" "$APP/Contents/Resources/"
+for search_dir in "${BUNDLE_SEARCH_DIRS[@]}"; do
+  shopt -s nullglob
+  bundles=("$search_dir"/*.bundle)
+  shopt -u nullglob
+  for bundle in "${bundles[@]}"; do
+    copy_resource_bundle "$bundle"
   done
-fi
+done
 
-# Embed frameworks if any exist in the build folder.
-FRAMEWORK_DIRS=(".build/$CONF" ".build/${ARCH_LIST[0]}-apple-macosx/$CONF")
-for dir in "${FRAMEWORK_DIRS[@]}"; do
-  if compgen -G "${dir}/*.framework" >/dev/null; then
-    cp -R "${dir}/"*.framework "$APP/Contents/Frameworks/"
+"$ROOT/Scripts/build_icon.sh" "$APP/Contents/Resources/Icon.icns"
+
+# Embed frameworks if a future package dependency produces one.
+for search_dir in "${BUNDLE_SEARCH_DIRS[@]}"; do
+  shopt -s nullglob
+  frameworks=("$search_dir"/*.framework)
+  shopt -u nullglob
+  if [[ ${#frameworks[@]} -gt 0 ]]; then
+    cp -R "${frameworks[@]}" "$APP/Contents/Frameworks/"
     chmod -R a+rX "$APP/Contents/Frameworks"
     install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/$APP_NAME"
     break
   fi
 done
 
-if [[ -f "$ICON_TARGET" ]]; then
-  cp "$ICON_TARGET" "$APP/Contents/Resources/Icon.icns"
-fi
-
-# Ensure contents are writable before stripping attributes and signing.
+# Extended attributes and AppleDouble files invalidate code sealing.
 chmod -R u+w "$APP"
-
-# Strip extended attributes to prevent AppleDouble files that break code sealing.
 xattr -cr "$APP"
 find "$APP" -name '._*' -delete
 
 ENTITLEMENTS_DIR="$ROOT/.build/entitlements"
 DEFAULT_ENTITLEMENTS="$ENTITLEMENTS_DIR/${APP_NAME}.entitlements"
 mkdir -p "$ENTITLEMENTS_DIR"
-
 APP_ENTITLEMENTS=${APP_ENTITLEMENTS:-$DEFAULT_ENTITLEMENTS}
 if [[ ! -f "$APP_ENTITLEMENTS" ]]; then
   cat > "$APP_ENTITLEMENTS" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <!-- Add entitlements here if needed. -->
-</dict>
-</plist>
+<plist version="1.0"><dict></dict></plist>
 PLIST
 fi
 
-case "$SIGNING_MODE" in
+case "${SIGNING_MODE:-local}" in
   local)
-    # Ad-hoc signatures use a build-specific cdhash, so Accessibility grants
-    # become stale after every rebuild. A persistent local identity gives TCC
-    # a stable designated requirement without needing an Apple developer cert.
+    # A persistent local identity keeps the Accessibility approval stable across
+    # rebuilds without requiring an Apple Developer certificate.
     eval "$(APP_NAME="$APP_NAME" "$ROOT/Scripts/setup_local_signing.sh" --print-env)"
     security unlock-keychain -p "$(<"$APP_KEYCHAIN_PASSWORD_FILE")" "$APP_KEYCHAIN"
     CODESIGN_ARGS=(--force --sign "$APP_IDENTITY" --keychain "$APP_KEYCHAIN")
     ;;
   adhoc)
-    CODESIGN_ARGS=(--force --sign "-")
+    CODESIGN_ARGS=(--force --sign - --timestamp=none)
     ;;
   identity)
-    if [[ -z "$APP_IDENTITY" ]]; then
+    if [[ -z ${APP_IDENTITY:-} ]]; then
       echo "ERROR: APP_IDENTITY is required when SIGNING_MODE=identity" >&2
       exit 1
     fi
     CODESIGN_ARGS=(--force --timestamp --options runtime --sign "$APP_IDENTITY")
-    if [[ -n "$APP_KEYCHAIN" ]]; then
+    if [[ -n ${APP_KEYCHAIN:-} ]]; then
       CODESIGN_ARGS+=(--keychain "$APP_KEYCHAIN")
     fi
     ;;
   *)
-    echo "ERROR: Unknown SIGNING_MODE '$SIGNING_MODE' (expected local, adhoc, or identity)" >&2
+    echo "ERROR: Unknown SIGNING_MODE '${SIGNING_MODE}' (expected local, adhoc, or identity)" >&2
     exit 1
     ;;
 esac
 
-# Sign embedded frameworks and their nested binaries before the app bundle.
 sign_frameworks() {
-  local fw
-  for fw in "$APP/Contents/Frameworks/"*.framework; do
-    if [[ ! -d "$fw" ]]; then
-      continue
-    fi
-    while IFS= read -r -d '' bin; do
-      codesign "${CODESIGN_ARGS[@]}" "$bin"
-    done < <(find "$fw" -type f -perm -111 -print0)
-    codesign "${CODESIGN_ARGS[@]}" "$fw"
+  local framework executable
+  for framework in "$APP/Contents/Frameworks/"*.framework; do
+    [[ -d "$framework" ]] || continue
+    while IFS= read -r -d '' executable; do
+      codesign "${CODESIGN_ARGS[@]}" "$executable"
+    done < <(find "$framework" -type f -perm -111 -print0)
+    codesign "${CODESIGN_ARGS[@]}" "$framework"
   done
 }
+
+sign_resource_bundles() {
+  local bundle
+  while IFS= read -r -d '' bundle; do
+    codesign "${CODESIGN_ARGS[@]}" "$bundle"
+  done < <(find "$APP/Contents/Resources" -type d -name '*.bundle' -prune -print0)
+}
+
 sign_frameworks
-
-codesign "${CODESIGN_ARGS[@]}" \
-  --entitlements "$APP_ENTITLEMENTS" \
-  "$APP"
-
+sign_resource_bundles
+codesign "${CODESIGN_ARGS[@]}" --entitlements "$APP_ENTITLEMENTS" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 echo "Created $APP"
 codesign -dr - "$APP" 2>&1 | tail -1

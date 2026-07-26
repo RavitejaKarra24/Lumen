@@ -1,85 +1,100 @@
 # Lumen
 
-Local-first macOS time tracker inspired by [rize.io](https://rize.io).
+A local-first macOS time tracker that turns your app, website, focus, and idle time into useful daily reports.
 
-Lumen records what you do on your Mac, understands it, then helps you behave like a builder — goals, distraction guards, project scores, and a ranked “what to build next.”
-
-## Goalposts
-
-| Stage | Status | Scope |
-| --- | --- | --- |
-| **1 · Recorder** | ✅ | Apps, websites, idle, tags, daily Markdown reports |
-| **2 · Intelligence** | ✅ | Page/transcript capture, classification, interests, ideas/actions |
-| **3 · Behaviour engine** | ✅ | Distraction warnings, creation goals, project scoring, weekly patterns, next-build picker |
+Lumen is source-distributed: it builds, signs, and installs on your Mac. No Apple Developer membership, administrator password, or global Gatekeeper changes are required.
 
 ## Features
 
-### Recorder
-- Menu bar + dashboard
-- App / window / URL tracking
-- Idle detection, categories, tags, notes
-- Focus score + deep-work blocks
-- Daily Markdown reports
-
-### Intelligence
-- Page text + YouTube transcript capture
-- Session kinds (deep work, learning, distraction, …)
-- Topic extraction + repeated interests
-- Learning summaries, ideas, action items
-
-### Behaviour engine
-- **Distraction warnings** — in-app toast, menu bar, optional system notifications
-- **Creation goals** — deep work, creation, learning, focus score, distraction caps
-- **Project scoring** — keyword-matched projects scored on time, deep work, momentum
-- **Weekly patterns** — hour-of-day and weekday focus/distraction shapes
-- **What to build next** — ranked recommendations from actions, ideas, projects, interests
+- Track the frontmost apps, windows, browser sites, and idle time
+- Review timelines, categories, tags, deep-work blocks, and focus score
+- Capture visited-page context locally and turn it into learning summaries, ideas, and actions
+- Set creation goals, get distraction warnings, score projects, and choose what to build next
+- Export daily Markdown reports
 
 ## Requirements
 
-- macOS 14+
-- Accessibility permission
-- Network optional (content capture)
-- Notification permission optional (distraction alerts)
+- macOS 14 or later
+- Xcode Command Line Tools — install once with `xcode-select --install`
+- Accessibility permission on first use (for window titles and browser URLs)
+- Notification permission is optional (for local distraction alerts)
 
-## Build & run
+## Install from source
 
-```bash
-swift build
-Scripts/run.sh
-```
-
-`Scripts/run.sh` signs development builds with a persistent, self-signed local identity stored in `~/Library/Application Support/Lumen Development Signing/`. This keeps the macOS Accessibility grant valid across rebuilds. The first run after switching from an ad-hoc build resets the stale permission record; grant Accessibility once more when Lumen prompts you.
-
-For a distributable build, provide an Apple signing identity instead:
+Clone this repository, open Terminal in its directory, then run:
 
 ```bash
-SIGNING_MODE=identity APP_IDENTITY="Developer ID Application: …" Scripts/run.sh
+./install.sh
 ```
 
-### Accessibility troubleshooting
+The installer checks for the Command Line Tools, builds a release app, generates Lumen’s icon, signs it with a persistent local-only identity, installs it to `~/Applications/Lumen.app`, verifies the installed bundle, and opens it.
 
-If System Settings shows Lumen enabled but the app still says permission is missing, the old grant is tied to a previous ad-hoc build. Run:
+It never uses `sudo`, disables Gatekeeper, or removes quarantine from anything except the app it just built locally.
+
+## First launch and permissions
+
+Lumen opens as a normal window and also lives in the menu bar. On the onboarding screen, choose **Open Accessibility Settings**, enable Lumen in **System Settings → Privacy & Security → Accessibility**, then return to Lumen and choose **I’ve granted access**.
+
+Accessibility lets Lumen read the frontmost app title and browser URL for activity tracking. Your activity data stays in `~/Library/Application Support/Lumen/`; it is not uploaded by Lumen.
+
+macOS may ask for notification permission if you enable system distraction alerts. These alerts are local.
+
+## Launch, update, and uninstall
+
+```bash
+# Launch an installed copy
+open "$HOME/Applications/Lumen.app"
+
+# Update an existing clone, then rebuild and replace the installed app
+git pull --ff-only
+./install.sh
+
+# Uninstall the app (this keeps your tracked data)
+pkill -f "$HOME/Applications/Lumen.app/Contents/MacOS/Lumen" 2>/dev/null || true
+rm -rf "$HOME/Applications/Lumen.app"
+
+# Optional: also remove all local Lumen data
+rm -rf "$HOME/Library/Application Support/Lumen"
+```
+
+A materially changed rebuild can cause macOS to ask for Accessibility again. If System Settings shows Lumen enabled but the app does not detect it, reset the record and run the installer again:
 
 ```bash
 tccutil reset Accessibility com.lumen.app
-Scripts/run.sh
+./install.sh
 ```
 
-Then click **Grant Accessibility** and enable Lumen once. Do not run the raw `.build/debug/Lumen` executable; launch `Lumen.app` so macOS checks the stable app identity.
+## Development
+
+```bash
+# Build and run the signed development app
+Scripts/run.sh
+
+# Build, package, and validate the release app
+Scripts/package_app.sh release
+
+```
+
+`Scripts/run.sh` uses the same persistent local signing identity as the installer, which helps macOS retain an Accessibility approval across ordinary rebuilds. To package with an Apple signing identity instead, use:
+
+```bash
+SIGNING_MODE=identity APP_IDENTITY="Developer ID Application: …" Scripts/package_app.sh release
+```
+
+The app icon is derived from `Assets/AppIcon.svg` by `Scripts/build_icon.sh`; do not edit the generated `Icon.icns`.
 
 ## Architecture
 
-```
-Services/
-  ActivityRecorder · BrowserInspector · ContentCapture
-  SessionClassifier · InsightEngine · IntelligenceService
-  BehaviourEngine · ProjectScorer · WeeklyPatternAnalyzer · NextBuildEngine
+```text
+App/       app lifecycle and UI-owned state
+Views/     SwiftUI dashboard, onboarding, menu bar, and settings
+Models/    activity, intelligence, and behaviour data
+Services/  recording, browser inspection, persistence, insights, and goals
 ```
 
-Data: `~/Library/Application Support/Lumen/`  
-(`segments`, `content`, `insights`, `goals`, `projects`, `warnings`, …)
+The app keeps SwiftUI state on the main actor while services handle activity capture, persistence, and analysis. Lumen’s local JSON store lives in `~/Library/Application Support/Lumen/`.
 
-## Shortcuts
+## Keyboard shortcuts
 
 | Action | Shortcut |
 | --- | --- |
@@ -89,9 +104,8 @@ Data: `~/Library/Application Support/Lumen/`
 | Run intelligence | ⌘⇧I |
 | Refresh behaviour | ⌘⇧B |
 
-## Privacy
+## Limitations
 
-- Local-first JSON store
-- No analytics SDKs
-- Content capture only for URLs you visited
-- Notifications are optional and local
+- Lumen requires Accessibility permission for browser URL and window-title tracking.
+- Website context capture requires network access to retrieve page content; core activity tracking remains local.
+- This source-distribution workflow builds on each user’s Mac. It is not a notarized downloadable DMG.

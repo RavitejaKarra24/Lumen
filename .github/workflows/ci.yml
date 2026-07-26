@@ -1,0 +1,19 @@
+name: Verify macOS app bundle
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, package, and ad-hoc sign
+        run: SIGNING_MODE=adhoc Scripts/package_app.sh release
+      - name: Validate the final artifact
+        run: |
+          test -x "Lumen.app/Contents/MacOS/Lumen"
+          test -f "Lumen.app/Contents/Resources/Icon.icns"
+          plutil -lint "Lumen.app/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "Lumen.app"

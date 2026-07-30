@@ -35,29 +35,28 @@ elif swift build --help 2>/dev/null | grep -q "swiftbuild"; then
   BUILD_SYSTEM_ARGS=(--build-system swiftbuild)
 fi
 
-BINARIES=()
-BUNDLE_SEARCH_DIRS=()
+ARCH_ARGS=()
 for arch in "${ARCH_LIST[@]}"; do
-  swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" --arch "$arch"
-  bin_dir="$(swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" --arch "$arch" --show-bin-path)"
-  binary="$bin_dir/$APP_NAME"
-  if [[ ! -f "$binary" ]]; then
-    echo "ERROR: Missing $APP_NAME build for $arch at $binary" >&2
-    exit 1
-  fi
-  BINARIES+=("$binary")
-  BUNDLE_SEARCH_DIRS+=("$bin_dir")
+  ARCH_ARGS+=(--arch "$arch")
 done
+
+# Pass every architecture to a single invocation so SwiftPM emits one universal
+# binary. Building each architecture in its own invocation does not work: both
+# builds resolve to the same bin path, so the second overwrites the first.
+swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" "${ARCH_ARGS[@]}"
+BIN_DIR="$(swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" "${ARCH_ARGS[@]}" --show-bin-path)"
+BINARY="$BIN_DIR/$APP_NAME"
+if [[ ! -f "$BINARY" ]]; then
+  echo "ERROR: Missing $APP_NAME build at $BINARY" >&2
+  exit 1
+fi
+BUNDLE_SEARCH_DIRS=("$BIN_DIR")
 
 APP="$ROOT/$APP_NAME.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
-if [[ ${#BINARIES[@]} -gt 1 ]]; then
-  lipo -create "${BINARIES[@]}" -output "$APP/Contents/MacOS/$APP_NAME"
-else
-  cp "${BINARIES[0]}" "$APP/Contents/MacOS/$APP_NAME"
-fi
+cp "$BINARY" "$APP/Contents/MacOS/$APP_NAME"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
 
 actual_arches="$(lipo -archs "$APP/Contents/MacOS/$APP_NAME")"

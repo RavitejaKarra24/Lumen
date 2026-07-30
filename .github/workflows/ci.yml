@@ -5,13 +5,41 @@ on:
   pull_request:
 
 jobs:
-  package:
+  download:
+    name: Verify the committed download
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build, package, and ad-hoc sign
-        run: SIGNING_MODE=adhoc Scripts/package_app.sh release
-      - name: Validate the final artifact
+      # The zip is a build artifact living in source control, so nothing else
+      # will notice when it goes stale. Verify the archive people actually
+      # download, before anything rebuilds over the top of it.
+      - name: Verify Lumen.zip unpacks, verifies, and matches version.env
+        run: |
+          set -euo pipefail
+          source version.env
+          VERIFY_DIR="$(mktemp -d)"
+          /usr/bin/ditto -x -k Lumen.zip "$VERIFY_DIR"
+          APP="$VERIFY_DIR/Lumen.app"
+          test -x "$APP/Contents/MacOS/Lumen"
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          lipo -archs "$APP/Contents/MacOS/Lumen"
+          ZIP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
+          if [[ "$ZIP_VERSION" != "$MARKETING_VERSION" ]]; then
+            echo "ERROR: Lumen.zip is stale. It contains $ZIP_VERSION, version.env says $MARKETING_VERSION." >&2
+            echo "Run Scripts/package_zip.sh and commit the result." >&2
+            exit 1
+          fi
+          echo "Committed download is version $ZIP_VERSION."
+
+  package:
+    name: Build, sign, and archive
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, ad-hoc sign, and archive
+        run: Scripts/package_zip.sh
+      - name: Validate the built bundle
         run: |
           test -x "Lumen.app/Contents/MacOS/Lumen"
           test -f "Lumen.app/Contents/Resources/Icon.icns"

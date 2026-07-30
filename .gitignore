@@ -1,3 +1,4 @@
+for_everyday_people.md
 .build/
 *.app
 *.dSYM
@@ -7,3 +8,7 @@
 xcuserdata/
 Icon.icns
 lessons.md
+
+# Lumen.zip is deliberately not ignored: it is the download linked from the
+# README, and it has to be committed at the repo root, outside .build/.
+

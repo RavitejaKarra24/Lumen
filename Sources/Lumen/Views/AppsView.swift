@@ -67,13 +67,15 @@ struct AppsView: View {
                         }
                     }
                     .listStyle(.inset)
-                    .searchable(text: $query, prompt: "Filter apps")
                 }
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        // Attached to the container, not the list: when a query matched nothing the
+        // search field disappeared along with the list, stranding the user.
+        .searchable(text: $query, prompt: "Filter apps")
     }
 
     private func shareLabel(_ part: TimeInterval, total: TimeInterval) -> String {

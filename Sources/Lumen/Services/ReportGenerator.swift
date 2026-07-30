@@ -28,6 +28,23 @@ enum ReportGenerator {
         lines.append("| Top website | \(analytics.topDomain) |")
         lines.append("")
 
+        if !analytics.deepWorkBlocks.isEmpty {
+            let blockTimeFormatter = DateFormatter()
+            blockTimeFormatter.dateFormat = "HH:mm"
+            lines.append("## Deep work blocks")
+            lines.append("")
+            lines.append("| Window | Focused | Focus | Apps |")
+            lines.append("| --- | --- | --- | --- |")
+            for block in analytics.deepWorkBlocks {
+                let window = "\(blockTimeFormatter.string(from: block.start))–\(blockTimeFormatter.string(from: block.end))"
+                let source = block.isFocusSession ? "Focus session" : block.dominantCategory.displayName
+                lines.append(
+                    "| \(window) | \(DurationFormat.compact(block.focusedDuration)) | \(source) | \(block.appNames.joined(separator: ", ")) |"
+                )
+            }
+            lines.append("")
+        }
+
         lines.append("## Categories")
         lines.append("")
         if analytics.categoryUsages.isEmpty {
@@ -210,6 +227,47 @@ enum ReportGenerator {
             base += "\n" + extra.joined(separator: "\n")
         }
         return base
+    }
+
+    /// One row per session, for spreadsheets and invoicing.
+    static func csv(for analytics: DayAnalytics) -> String {
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withInternetDateTime]
+
+        var rows = [
+            "start,end,duration_seconds,app,bundle_id,window_title,domain,url,category,session_kind,is_idle,tags,notes",
+        ]
+        for segment in analytics.segments {
+            let start = max(segment.startAt, analytics.dayStart)
+            let end = min(segment.endAt ?? .now, analytics.dayEnd)
+            let duration = max(0, end.timeIntervalSince(start))
+            let fields = [
+                stamp.string(from: start),
+                stamp.string(from: end),
+                String(format: "%.0f", duration),
+                segment.appName,
+                segment.bundleIdentifier,
+                segment.windowTitle,
+                segment.domain ?? "",
+                segment.urlString ?? "",
+                segment.category.displayName,
+                segment.sessionKind.displayName,
+                segment.isIdle ? "true" : "false",
+                segment.tags.joined(separator: "; "),
+                segment.notes,
+            ]
+            rows.append(fields.map(escapeCSV).joined(separator: ","))
+        }
+        return rows.joined(separator: "\n") + "\n"
+    }
+
+    private static func escapeCSV(_ value: String) -> String {
+        // Strip newlines so every session stays on one row, then quote.
+        let flattened = value
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return "\"\(flattened.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     static func makeSnapshot(from analytics: DayAnalytics, behaviour: BehaviourSnapshot? = nil) -> DailySnapshot {

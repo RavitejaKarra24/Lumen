@@ -20,10 +20,31 @@ actor ActivityStore {
             .appendingPathComponent("Lumen", isDirectory: true)
     }
 
+    /// Files the store owns. Writes are coalesced per file.
+    private enum StoreFile: String, CaseIterable {
+        case segments = "segments.json"
+        case tags = "tags.json"
+        case snapshots = "snapshots.json"
+        case contents = "content.json"
+        case insights = "insights.json"
+        case goals = "goals.json"
+        case projects = "projects.json"
+        case warnings = "warnings.json"
+        case focusSessions = "focus-sessions.json"
+        case dismissedInsights = "dismissed-insights.json"
+    }
+
+    /// The recorder touches the open segment every few seconds. Rewriting the whole
+    /// history on each touch is what makes long-lived installs crawl, so writes are
+    /// batched and flushed on a short delay instead.
+    private static let flushDelay: Duration = .seconds(3)
+
     private let directory: URL
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var loaded = false
+    private var dirtyFiles: Set<StoreFile> = []
+    private var flushTask: Task<Void, Never>?
 
     init(directory: URL? = nil) {
         if let directory {
@@ -67,7 +88,7 @@ actor ActivityStore {
             segments[index].endAt = segments[index].lastObservedAt ?? segments[index].startAt
             mutated = true
         }
-        if mutated { try persistSegments() }
+        if mutated { persistSegments() }
         loaded = true
     }
 
@@ -96,28 +117,28 @@ actor ActivityStore {
     func insert(_ segment: ActivitySegment) throws {
         try loadIfNeeded()
         segments.append(segment)
-        try persistSegments()
+        persistSegments()
     }
 
     func replaceSegment(_ segment: ActivitySegment) throws {
         try loadIfNeeded()
         guard let index = segments.firstIndex(where: { $0.id == segment.id }) else { return }
         segments[index] = segment
-        try persistSegments()
+        persistSegments()
     }
 
     func setTags(id: UUID, tags: [String]) throws {
         try loadIfNeeded()
         guard let index = segments.firstIndex(where: { $0.id == id }) else { return }
         segments[index].tags = tags
-        try persistSegments()
+        persistSegments()
     }
 
     func setNotes(id: UUID, notes: String) throws {
         try loadIfNeeded()
         guard let index = segments.firstIndex(where: { $0.id == id }) else { return }
         segments[index].notes = notes
-        try persistSegments()
+        persistSegments()
     }
 
     func segment(id: UUID) throws -> ActivitySegment? {
@@ -134,17 +155,183 @@ actor ActivityStore {
             let removedID = segments[index].id
             segments.remove(at: index)
             contents.removeAll { $0.segmentID == removedID }
-            try persistContents()
+            persistContents()
         }
-        try persistSegments()
+        persistSegments()
+    }
+
+    /// Applies many segment edits with a single persist, for callers that
+    /// reclassify a whole day at once.
+    func replaceSegments(_ updated: [ActivitySegment]) throws {
+        try loadIfNeeded()
+        guard !updated.isEmpty else { return }
+        var indexByID: [UUID: Int] = [:]
+        for (index, segment) in segments.enumerated() {
+            indexByID[segment.id] = index
+        }
+        var changed = false
+        for segment in updated {
+            guard let index = indexByID[segment.id], segments[index] != segment else { continue }
+            segments[index] = segment
+            changed = true
+        }
+        if changed { persistSegments() }
     }
 
     func deleteSegment(id: UUID) throws {
         try loadIfNeeded()
         segments.removeAll { $0.id == id }
         contents.removeAll { $0.segmentID == id }
-        try persistSegments()
-        try persistContents()
+        persistSegments()
+        persistContents()
+    }
+
+    /// Closes whatever segment is still open. Safe to call off the main actor,
+    /// which matters during app termination.
+    func closeOpenSegment(at date: Date, minimumDuration: TimeInterval) throws {
+        try loadIfNeeded()
+        guard let open = segments.last(where: { $0.endAt == nil }) else { return }
+        try closeSegment(id: open.id, at: date, minimumDuration: minimumDuration)
+    }
+
+    // MARK: - Analysis
+
+    /// Analyses one day inside the actor so the heavy filtering and merging stays
+    /// off the main thread, and only the finished result crosses back.
+    func analytics(for day: Date, calendar: Calendar = .current) throws -> DayAnalytics {
+        try loadIfNeeded()
+        let (start, end) = AnalyticsService.dayInterval(for: day, calendar: calendar)
+        let daySegments = segments
+            .filter { segment in
+                let segEnd = segment.endAt ?? .now
+                return segment.startAt < end && segEnd >= start
+            }
+            .sorted { $0.startAt < $1.startAt }
+        let daySessions = focusSessions.filter { session in
+            let sessionEnd = min(session.endAt ?? .now, session.scheduledEndAt)
+            return session.startAt < end && sessionEnd >= start
+        }
+        return AnalyticsService.analyze(
+            segments: daySegments,
+            focusSessions: daySessions,
+            dayStart: start,
+            dayEnd: end
+        )
+    }
+
+    /// Everything the behaviour engine needs, computed in one pass on this actor.
+    ///
+    /// Previously the engine pulled the whole history to the main actor and ran the
+    /// weekly analyser, project scorer, and topic extraction there — several times a
+    /// minute, which showed up as UI stutter once a few weeks of data accumulated.
+    struct BehaviourInputs: Sendable {
+        var todayAnalytics: DayAnalytics
+        var interests: [InterestSignal]
+        var weekly: WeeklyPatternReport
+        var projectScores: [ProjectScore]
+        var recommendations: [BuildRecommendation]
+        var deepWorkByDay: [Date: TimeInterval]
+        var todayCreationMinutes: Double
+        var todayLearningMinutes: Double
+        var todayDistractionMinutes: Double
+        var openSegment: ActivitySegment?
+        var goals: [CreationGoal]
+        var projects: [ProjectDefinition]
+        var recentWarnings: [BehaviourWarning]
+    }
+
+    func behaviourInputs(now: Date = .now, calendar: Calendar = .current) throws -> BehaviourInputs {
+        try loadIfNeeded()
+
+        let todayAnalytics = try analytics(for: now, calendar: calendar)
+        let todaySegments = todayAnalytics.segments
+
+        func minutes(where predicate: (ActivitySegment) -> Bool) -> Double {
+            todaySegments.filter(predicate).reduce(0.0) { $0 + $1.duration } / 60.0
+        }
+
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) ?? now
+        let weekSegments = segments.filter { $0.startAt >= weekAgo }
+        let interests = InterestDetector.detect(segments: weekSegments)
+
+        let insights = insightRecords
+        let insightCutoff = calendar.date(byAdding: .day, value: -30, to: now) ?? .distantPast
+        let openActions = insights.filter {
+            $0.kind == .actionItem && !$0.isCompleted && $0.createdAt >= insightCutoff
+        }
+        let openIdeas = insights.filter {
+            $0.kind == .idea && !$0.isCompleted && $0.createdAt >= insightCutoff
+        }
+
+        let weekly = WeeklyPatternAnalyzer.analyze(
+            segments: segments,
+            endingOn: now,
+            interests: interests
+        )
+        let projectScores = ProjectScorer.score(
+            projects: projects,
+            segments: segments,
+            insights: insights,
+            now: now
+        )
+        let recommendations = NextBuildEngine.recommend(
+            projectScores: projectScores,
+            interests: interests,
+            ideas: openIdeas,
+            actions: openActions,
+            weekly: weekly
+        )
+
+        return BehaviourInputs(
+            todayAnalytics: todayAnalytics,
+            interests: interests,
+            weekly: weekly,
+            projectScores: projectScores,
+            recommendations: recommendations,
+            deepWorkByDay: AnalyticsService.deepWorkSecondsByDay(
+                segments: segments,
+                focusSessions: focusSessions,
+                calendar: calendar
+            ),
+            todayCreationMinutes: minutes { $0.sessionKind == .creation || $0.sessionKind == .deepWork },
+            todayLearningMinutes: minutes { $0.sessionKind == .learning || $0.sessionKind == .research },
+            todayDistractionMinutes: minutes { $0.sessionKind == .distraction },
+            openSegment: todaySegments.last(where: { $0.endAt == nil }),
+            goals: goals.sorted { $0.createdAt < $1.createdAt },
+            projects: projects.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending },
+            recentWarnings: Array(warnings.sorted { $0.createdAt > $1.createdAt }.prefix(20))
+        )
+    }
+
+    func deepWorkSecondsByDay(calendar: Calendar = .current) throws -> [Date: TimeInterval] {
+        try loadIfNeeded()
+        return AnalyticsService.deepWorkSecondsByDay(
+            segments: segments,
+            focusSessions: focusSessions,
+            calendar: calendar
+        )
+    }
+
+    // MARK: - Retention
+
+    /// Deletes activity older than `days`, keeping generated reports so history
+    /// stays readable after the raw segments are gone. Returns segments removed.
+    @discardableResult
+    func pruneSegments(olderThan days: Int, calendar: Calendar = .current) throws -> Int {
+        try loadIfNeeded()
+        guard days > 0 else { return 0 }
+        let cutoff = calendar.date(byAdding: .day, value: -days, to: calendar.startOfDay(for: .now))
+            ?? Date.distantPast
+        let doomed = segments.filter { ($0.endAt ?? .now) < cutoff }
+        guard !doomed.isEmpty else { return 0 }
+        let doomedIDs = Set(doomed.map(\.id))
+        segments.removeAll { doomedIDs.contains($0.id) }
+        contents.removeAll { doomedIDs.contains($0.segmentID) }
+        insightRecords.removeAll { $0.dayStart < cutoff && !$0.isPinned }
+        persistSegments()
+        persistContents()
+        persistInsights()
+        return doomed.count
     }
 
     // MARK: - Tags
@@ -162,7 +349,7 @@ actor ActivityStore {
             return
         }
         tags.append(TagDefinition(name: cleaned, colorHex: colorHex))
-        try persistTags()
+        persistTags()
     }
 
     func deleteTag(id: UUID) throws {
@@ -174,8 +361,8 @@ actor ActivityStore {
                 $0.caseInsensitiveCompare(tag.name) == .orderedSame
             }
         }
-        try persistTags()
-        try persistSegments()
+        persistTags()
+        persistSegments()
     }
 
     // MARK: - Snapshots
@@ -192,7 +379,7 @@ actor ActivityStore {
         } else {
             snapshots.append(snapshot)
         }
-        try persistSnapshots()
+        persistSnapshots()
     }
 
     func snapshot(on day: Date) throws -> DailySnapshot? {
@@ -245,7 +432,7 @@ actor ActivityStore {
         if contents.count > 5000 {
             contents = Array(contents.suffix(4000))
         }
-        try persistContents()
+        persistContents()
     }
 
     // MARK: - Insights
@@ -283,7 +470,7 @@ actor ActivityStore {
             return !keptKeys.contains(key) && !dismissedInsightKeys.contains(key)
         }
         insightRecords = kept + fresh
-        try persistInsights()
+        persistInsights()
     }
 
     func upsertInsight(_ insight: InsightRecord) throws {
@@ -293,7 +480,7 @@ actor ActivityStore {
         } else {
             insightRecords.append(insight)
         }
-        try persistInsights()
+        persistInsights()
     }
 
     func deleteInsight(id: UUID) throws {
@@ -302,8 +489,8 @@ actor ActivityStore {
             dismissedInsightKeys.insert(insightKey(record))
         }
         insightRecords.removeAll { $0.id == id }
-        try persistInsights()
-        try persistDismissedInsightKeys()
+        persistInsights()
+        persistDismissedInsightKeys()
     }
 
     // MARK: - Goals
@@ -320,13 +507,13 @@ actor ActivityStore {
         } else {
             goals.append(goal)
         }
-        try persistGoals()
+        persistGoals()
     }
 
     func deleteGoal(id: UUID) throws {
         try loadIfNeeded()
         goals.removeAll { $0.id == id }
-        try persistGoals()
+        persistGoals()
     }
 
     // MARK: - Projects
@@ -343,13 +530,13 @@ actor ActivityStore {
         } else {
             projects.append(project)
         }
-        try persistProjects()
+        persistProjects()
     }
 
     func deleteProject(id: UUID) throws {
         try loadIfNeeded()
         projects.removeAll { $0.id == id }
-        try persistProjects()
+        persistProjects()
     }
 
     // MARK: - Focus sessions
@@ -374,7 +561,7 @@ actor ActivityStore {
         if focusSessions.count > 1000 {
             focusSessions = Array(focusSessions.sorted { $0.startAt > $1.startAt }.prefix(800))
         }
-        try persistFocusSessions()
+        persistFocusSessions()
     }
 
     // MARK: - Warnings
@@ -394,7 +581,7 @@ actor ActivityStore {
         if warnings.count > 300 {
             warnings = Array(warnings.sorted { $0.createdAt > $1.createdAt }.prefix(200))
         }
-        try persistWarnings()
+        persistWarnings()
     }
 
     private func insightKey(_ insight: InsightRecord) -> String {
@@ -413,44 +600,60 @@ actor ActivityStore {
 
     // MARK: - Persistence
 
-    private func persistSegments() throws {
-        try write(segments, to: "segments.json")
+    private func persistSegments() { markDirty(.segments) }
+    private func persistTags() { markDirty(.tags) }
+    private func persistSnapshots() { markDirty(.snapshots) }
+    private func persistContents() { markDirty(.contents) }
+    private func persistInsights() { markDirty(.insights) }
+    private func persistGoals() { markDirty(.goals) }
+    private func persistProjects() { markDirty(.projects) }
+    private func persistWarnings() { markDirty(.warnings) }
+    private func persistFocusSessions() { markDirty(.focusSessions) }
+    private func persistDismissedInsightKeys() { markDirty(.dismissedInsights) }
+
+    private func markDirty(_ file: StoreFile) {
+        dirtyFiles.insert(file)
+        guard flushTask == nil else { return }
+        flushTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.flushDelay)
+            await self?.performFlush()
+        }
     }
 
-    private func persistTags() throws {
-        try write(tags, to: "tags.json")
+    /// Writes every pending change immediately. Call before the process exits.
+    func flush() {
+        flushTask?.cancel()
+        flushTask = nil
+        performFlush()
     }
 
-    private func persistSnapshots() throws {
-        try write(snapshots, to: "snapshots.json")
+    private func performFlush() {
+        flushTask = nil
+        let pending = dirtyFiles
+        dirtyFiles.removeAll()
+        for file in pending {
+            do {
+                try write(file)
+            } catch {
+                // Put it back so the next flush retries rather than losing the change.
+                dirtyFiles.insert(file)
+            }
+        }
     }
 
-    private func persistContents() throws {
-        try write(contents, to: "content.json")
-    }
-
-    private func persistInsights() throws {
-        try write(insightRecords, to: "insights.json")
-    }
-
-    private func persistGoals() throws {
-        try write(goals, to: "goals.json")
-    }
-
-    private func persistProjects() throws {
-        try write(projects, to: "projects.json")
-    }
-
-    private func persistWarnings() throws {
-        try write(warnings, to: "warnings.json")
-    }
-
-    private func persistFocusSessions() throws {
-        try write(focusSessions, to: "focus-sessions.json")
-    }
-
-    private func persistDismissedInsightKeys() throws {
-        try write(dismissedInsightKeys, to: "dismissed-insights.json")
+    private func write(_ file: StoreFile) throws {
+        switch file {
+        case .segments: try write(segments, to: file.rawValue)
+        case .tags: try write(tags, to: file.rawValue)
+        case .snapshots: try write(snapshots, to: file.rawValue)
+        case .contents: try write(contents, to: file.rawValue)
+        case .insights: try write(insightRecords, to: file.rawValue)
+        case .goals: try write(goals, to: file.rawValue)
+        case .projects: try write(projects, to: file.rawValue)
+        case .warnings: try write(warnings, to: file.rawValue)
+        case .focusSessions: try write(focusSessions, to: file.rawValue)
+        case .dismissedInsights: try write(dismissedInsightKeys, to: file.rawValue)
+        }
     }
 
     private func write<T: Encodable>(_ value: T, to name: String) throws {

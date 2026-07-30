@@ -1,8 +1,30 @@
 import AppKit
 import SwiftUI
 
+/// Keeps the tracker alive when the dashboard window closes, and makes sure the
+/// open segment and any batched writes reach disk before the process exits.
+final class LumenAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        // Lumen lives in the menu bar; closing the dashboard should not stop tracking.
+        false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Detached so the wait below cannot deadlock against the main actor.
+        let done = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            let store = ActivityStore.shared
+            try? await store.closeOpenSegment(at: .now, minimumDuration: 1.5)
+            await store.flush()
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 4)
+    }
+}
+
 @main
 struct LumenApp: App {
+    @NSApplicationDelegateAdaptor(LumenAppDelegate.self) private var appDelegate
     @State private var appState = AppState()
 
     var body: some Scene {
@@ -23,9 +45,13 @@ struct LumenApp: App {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
 
                 Button("Export Markdown Report…") {
-                    appState.exportReportToDownloads()
+                    appState.exportReportToDownloads(format: .markdown)
                 }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
+
+                Button("Export Sessions as CSV…") {
+                    appState.exportReportToDownloads(format: .csv)
+                }
             }
             CommandMenu("Tracking") {
                 Button(appState.recorder.isRunning ? "Pause Tracking" : "Resume Tracking") {

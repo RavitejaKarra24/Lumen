@@ -7,10 +7,32 @@ Lumen is source-distributed: it builds, signs, and installs on your Mac. No Appl
 ## Features
 
 - Track the frontmost apps, windows, browser sites, and idle time
-- Review timelines, categories, tags, deep-work blocks, and focus score
+- See the whole day as a proportional 24-hour strip, then drill into any session
+- Review categories, tags, deep-work blocks, and focus score
 - Capture visited-page context locally and turn it into learning summaries, ideas, and actions
 - Set creation goals, get distraction warnings, score projects, and choose what to build next
-- Export daily Markdown reports
+- Export daily Markdown reports, or every session as CSV
+
+### How deep work is measured
+
+The recorder starts a new session whenever the window title changes, so a long
+stretch of work arrives as dozens of short segments. Lumen merges adjacent focused
+segments into a single block, bridging interruptions shorter than two minutes, and
+counts a block once it spans 25 minutes or more. Only the focused time inside a
+block is counted, not the interruptions it bridged. Time spent inside an explicit
+focus session always counts, even if you end the session early.
+
+## Data and performance
+
+Activity lives in `~/Library/Application Support/Lumen/` as JSON. Writes are
+batched and flushed on a short delay rather than after every observation, and the
+day's analysis runs off the main thread, so the interface stays responsive as
+history grows. **Settings → Data** can cap how long raw sessions are kept;
+generated reports are never pruned.
+
+Closing the dashboard window does not stop tracking — Lumen keeps running in the
+menu bar. Use **Quit Lumen** from the menu bar to stop it, which closes the open
+session and flushes pending writes first.
 
 ## Requirements
 

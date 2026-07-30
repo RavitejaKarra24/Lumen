@@ -16,6 +16,10 @@ final class ActivityRecorder {
     var idleThreshold: TimeInterval = 120
     /// Minimum duration before a segment is kept when it ends (filters flicker).
     var minimumSegmentDuration: TimeInterval = 1.5
+    /// How often the open segment's heartbeat is written. Every heartbeat rewrites
+    /// the segment file, so this trades crash-recovery precision for far less disk
+    /// churn on a tracker that runs all day.
+    var observationInterval: TimeInterval = 30
 
     private let store: ActivityStore
     private var timer: Timer?
@@ -76,6 +80,10 @@ final class ActivityRecorder {
         currentSnapshot = snapshot
 
         let now = Date.now
+        // The user actually stopped working when input stopped, not when the
+        // threshold elapsed. Backdating keeps the idle threshold from being
+        // silently credited as active time on every single break.
+        let idleSince = idle ? now.addingTimeInterval(-secondsIdle) : now
         transitionTask = Task { [weak self] in
             guard let self else { return }
             defer { self.transitionTask = nil }
@@ -83,7 +91,7 @@ final class ActivityRecorder {
                 try await self.store.loadIfNeeded()
                 let open = try await self.store.openSegment()
                 if idle {
-                    try await self.handleIdle(now: now, open: open)
+                    try await self.handleIdle(now: now, idleSince: idleSince, open: open)
                 } else if let snapshot {
                     try await self.handleActive(snapshot: snapshot, now: now, open: open)
                 }
@@ -94,18 +102,24 @@ final class ActivityRecorder {
         }
     }
 
-    private func handleIdle(now: Date, open: ActivitySegment?) async throws {
+    private func handleIdle(now: Date, idleSince: Date, open: ActivitySegment?) async throws {
+        var idleStart = min(idleSince, now)
+
         if let open {
             if open.isIdle {
                 try await touch(open, at: now)
                 return
             }
-            try await store.closeSegment(id: open.id, at: now, minimumDuration: minimumSegmentDuration)
+            // Never rewind the active segment before it began, or past work we
+            // already observed it doing.
+            idleStart = max(open.lastObservedAt ?? open.startAt, idleStart)
+            try await store.closeSegment(id: open.id, at: idleStart, minimumDuration: minimumSegmentDuration)
         }
 
         if try await store.openSegment() == nil {
             let segment = ActivitySegment(
-                startAt: now,
+                startAt: idleStart,
+                lastObservedAt: now,
                 appName: "Idle",
                 bundleIdentifier: "lumen.idle",
                 windowTitle: "Away",
@@ -141,14 +155,14 @@ final class ActivityRecorder {
                     updated.urlString = snapshot.urlString
                     updated.domain = domain
                 }
-                if now.timeIntervalSince(updated.lastObservedAt ?? updated.startAt) >= 10 {
+                if now.timeIntervalSince(updated.lastObservedAt ?? updated.startAt) >= observationInterval {
                     updated.lastObservedAt = now
                 }
                 // Lightweight live reclassify on title/url drift.
                 if updated != open {
                     var probe = updated
                     probe.category = baseCategory
-                    let classified = SessionClassifier.classify(probe)
+                    let classified = SessionClassifier.classify(probe, extractTopics: false)
                     updated.category = classified.category
                     updated.sessionKind = classified.kind
                     updated.topics = classified.topics
@@ -170,7 +184,7 @@ final class ActivityRecorder {
             isIdle: false,
             category: baseCategory
         )
-        let classified = SessionClassifier.classify(segment)
+        let classified = SessionClassifier.classify(segment, extractTopics: false)
         segment.category = classified.category
         segment.sessionKind = classified.kind
         segment.topics = classified.topics
@@ -208,7 +222,7 @@ final class ActivityRecorder {
     }
 
     private func touch(_ segment: ActivitySegment, at date: Date) async throws {
-        guard date.timeIntervalSince(segment.lastObservedAt ?? segment.startAt) >= 10 else { return }
+        guard date.timeIntervalSince(segment.lastObservedAt ?? segment.startAt) >= observationInterval else { return }
         var updated = segment
         updated.lastObservedAt = date
         try await store.replaceSegment(updated)

@@ -83,13 +83,15 @@ struct WebsitesView: View {
                         }
                     }
                     .listStyle(.inset)
-                    .searchable(text: $query, prompt: "Filter domains")
                 }
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        // Attached to the container, not the list: when a query matched nothing the
+        // search field disappeared along with the list, stranding the user.
+        .searchable(text: $query, prompt: "Filter domains")
     }
 
     private var emptyStateMessage: String {

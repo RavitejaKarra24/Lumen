@@ -21,6 +21,22 @@ struct CategoryUsage: Identifiable, Sendable {
     var duration: TimeInterval
 }
 
+/// A stretch of sustained focused work, merged across the many short segments the
+/// recorder emits when a window title changes.
+struct DeepWorkBlock: Identifiable, Sendable, Hashable {
+    var id: Date { start }
+    var start: Date
+    var end: Date
+    /// Wall-clock span, including any brief interruptions bridged into the block.
+    var span: TimeInterval { max(0, end.timeIntervalSince(start)) }
+    /// Time actually spent on focused work inside the span.
+    var focusedDuration: TimeInterval
+    var dominantCategory: ActivityCategory
+    var appNames: [String]
+    /// True when an explicit focus session anchors the block.
+    var isFocusSession: Bool
+}
+
 struct DayAnalytics: Sendable {
     var dayStart: Date
     var dayEnd: Date
@@ -34,14 +50,30 @@ struct DayAnalytics: Sendable {
     var topAppName: String
     var topDomain: String
     var deepWorkDuration: TimeInterval
+    var deepWorkBlocks: [DeepWorkBlock]
     var contextSwitches: Int
 }
 
 enum AnalyticsService {
+    /// A block survives interruptions shorter than this (an app switch, a quick
+    /// Slack reply) without being torn in two.
+    static let deepWorkGapTolerance: TimeInterval = 2 * 60
+    /// Minimum wall-clock span before a run of focused work counts as deep work.
+    static let deepWorkMinimumBlock: TimeInterval = 25 * 60
+
     static func dayInterval(for date: Date, calendar: Calendar = .current) -> (start: Date, end: Date) {
         let start = calendar.startOfDay(for: date)
         let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86400)
         return (start, end)
+    }
+
+    /// Focused work is high-weight categories plus anything the classifier already
+    /// judged to be deep work or creation.
+    static func isFocusedWork(_ segment: ActivitySegment) -> Bool {
+        guard !segment.isIdle else { return false }
+        if segment.sessionKind == .deepWork || segment.sessionKind == .creation { return true }
+        if segment.sessionKind == .distraction { return false }
+        return segment.category.focusWeight >= 0.9
     }
 
     static func analyze(
@@ -80,7 +112,7 @@ enum AnalyticsService {
         var idle: TimeInterval = 0
         var weightedFocus: TimeInterval = 0
         var activeIntervals: [(start: Date, end: Date)] = []
-        var deepWorkIntervals: [(start: Date, end: Date)] = []
+        var focusedSpans: [FocusedSpan] = []
         var switches = 0
         var previousBundle: String?
 
@@ -90,22 +122,26 @@ enum AnalyticsService {
 
             if segment.isIdle {
                 idle += clipped
-                previousBundle = "lumen.idle"
+                // Stepping away and returning to the same app is not a context switch.
                 continue
             }
 
             active += clipped
             weightedFocus += clipped * segment.category.focusWeight
-            activeIntervals.append((
-                start: max(segment.startAt, dayStart),
-                end: min(segment.endAt ?? .now, dayEnd)
-            ))
+            let clippedStart = max(segment.startAt, dayStart)
+            let clippedEnd = min(segment.endAt ?? .now, dayEnd)
+            activeIntervals.append((start: clippedStart, end: clippedEnd))
 
-            if segment.category.focusWeight >= 0.9, clipped >= 25 * 60 {
-                deepWorkIntervals.append((
-                    start: max(segment.startAt, dayStart),
-                    end: min(segment.endAt ?? .now, dayEnd)
-                ))
+            if isFocusedWork(segment) {
+                focusedSpans.append(
+                    FocusedSpan(
+                        start: clippedStart,
+                        end: clippedEnd,
+                        category: segment.category,
+                        appName: segment.appName,
+                        isFocusSession: false
+                    )
+                )
             }
 
             let key = segment.bundleIdentifier
@@ -152,6 +188,8 @@ enum AnalyticsService {
             .map { CategoryUsage(category: $0.key, duration: $0.value) }
             .sorted { $0.duration > $1.duration }
 
+        // Any active time inside an explicit focus session is focused work by
+        // definition, whatever the app happened to be.
         for session in focusSessions {
             let focusStart = max(session.startAt, dayStart)
             let focusEnd = min(session.endAt ?? .now, min(session.scheduledEndAt, dayEnd))
@@ -160,11 +198,21 @@ enum AnalyticsService {
                 let start = max(focusStart, activeInterval.start)
                 let end = min(focusEnd, activeInterval.end)
                 if end > start {
-                    deepWorkIntervals.append((start: start, end: end))
+                    focusedSpans.append(
+                        FocusedSpan(
+                            start: start,
+                            end: end,
+                            category: .productivity,
+                            appName: session.title,
+                            isFocusSession: true
+                        )
+                    )
                 }
             }
         }
-        let deepWork = mergedDuration(deepWorkIntervals)
+
+        let blocks = deepWorkBlocks(from: focusedSpans)
+        let deepWork = blocks.reduce(0) { $0 + $1.focusedDuration }
 
         let focusScore: Double
         if active > 0 {
@@ -186,11 +234,88 @@ enum AnalyticsService {
             topAppName: apps.first?.appName ?? "—",
             topDomain: domains.first?.domain ?? "—",
             deepWorkDuration: deepWork,
+            deepWorkBlocks: blocks,
             contextSwitches: switches
         )
     }
 
-    private static func mergedDuration(_ intervals: [(start: Date, end: Date)]) -> TimeInterval {
+    // MARK: - Deep work blocks
+
+    struct FocusedSpan: Sendable {
+        var start: Date
+        var end: Date
+        var category: ActivityCategory
+        var appName: String
+        var isFocusSession: Bool
+    }
+
+    /// Merges overlapping and near-adjacent focused spans into blocks, then keeps
+    /// the ones long enough to count as deep work.
+    ///
+    /// The recorder splits a segment on every window-title change, so a two-hour
+    /// coding session arrives here as dozens of short spans. Testing each span on
+    /// its own would find no deep work at all.
+    static func deepWorkBlocks(
+        from spans: [FocusedSpan],
+        gapTolerance: TimeInterval = deepWorkGapTolerance,
+        minimumBlock: TimeInterval = deepWorkMinimumBlock
+    ) -> [DeepWorkBlock] {
+        let sorted = spans.filter { $0.end > $0.start }.sorted { $0.start < $1.start }
+        guard !sorted.isEmpty else { return [] }
+
+        struct Run {
+            var start: Date
+            var end: Date
+            var covered: [(start: Date, end: Date)]
+            var categoryTime: [ActivityCategory: TimeInterval]
+            var appTime: [String: TimeInterval]
+            var isFocusSession: Bool
+        }
+
+        var runs: [Run] = []
+        for span in sorted {
+            let duration = span.end.timeIntervalSince(span.start)
+            if var current = runs.last, span.start <= current.end.addingTimeInterval(gapTolerance) {
+                current.end = max(current.end, span.end)
+                current.covered.append((span.start, span.end))
+                current.categoryTime[span.category, default: 0] += duration
+                current.appTime[span.appName, default: 0] += duration
+                current.isFocusSession = current.isFocusSession || span.isFocusSession
+                runs[runs.count - 1] = current
+            } else {
+                runs.append(
+                    Run(
+                        start: span.start,
+                        end: span.end,
+                        covered: [(span.start, span.end)],
+                        categoryTime: [span.category: duration],
+                        appTime: [span.appName: duration],
+                        isFocusSession: span.isFocusSession
+                    )
+                )
+            }
+        }
+
+        return runs.compactMap { run -> DeepWorkBlock? in
+            // A deliberate focus session always counts, even if it was cut short.
+            guard run.isFocusSession || run.end.timeIntervalSince(run.start) >= minimumBlock else {
+                return nil
+            }
+            return DeepWorkBlock(
+                start: run.start,
+                end: run.end,
+                focusedDuration: mergedDuration(run.covered),
+                dominantCategory: run.categoryTime.max(by: { $0.value < $1.value })?.key ?? .other,
+                appNames: run.appTime
+                    .sorted { $0.value > $1.value }
+                    .prefix(3)
+                    .map(\.key),
+                isFocusSession: run.isFocusSession
+            )
+        }
+    }
+
+    static func mergedDuration(_ intervals: [(start: Date, end: Date)]) -> TimeInterval {
         let sorted = intervals.sorted { $0.start < $1.start }
         guard var current = sorted.first else { return 0 }
         var total: TimeInterval = 0
@@ -205,6 +330,71 @@ enum AnalyticsService {
         }
         total += current.end.timeIntervalSince(current.start)
         return total
+    }
+
+    /// Deep-work seconds per calendar day across a whole history, in one pass.
+    ///
+    /// Cheaper than running `analyze` once per day when computing streaks.
+    static func deepWorkSecondsByDay(
+        segments: [ActivitySegment],
+        focusSessions: [FocusSession],
+        calendar: Calendar = .current
+    ) -> [Date: TimeInterval] {
+        var spans: [FocusedSpan] = []
+        var activeIntervals: [(start: Date, end: Date)] = []
+
+        for segment in segments where !segment.isIdle {
+            let end = segment.endAt ?? .now
+            guard end > segment.startAt else { continue }
+            activeIntervals.append((segment.startAt, end))
+            if isFocusedWork(segment) {
+                spans.append(
+                    FocusedSpan(
+                        start: segment.startAt,
+                        end: end,
+                        category: segment.category,
+                        appName: segment.appName,
+                        isFocusSession: false
+                    )
+                )
+            }
+        }
+
+        for session in focusSessions {
+            let start = session.startAt
+            let end = min(session.endAt ?? .now, session.scheduledEndAt)
+            guard end > start else { continue }
+            for interval in activeIntervals {
+                let overlapStart = max(start, interval.start)
+                let overlapEnd = min(end, interval.end)
+                if overlapEnd > overlapStart {
+                    spans.append(
+                        FocusedSpan(
+                            start: overlapStart,
+                            end: overlapEnd,
+                            category: .productivity,
+                            appName: session.title,
+                            isFocusSession: true
+                        )
+                    )
+                }
+            }
+        }
+
+        var totals: [Date: TimeInterval] = [:]
+        for block in deepWorkBlocks(from: spans) {
+            // Split the block across midnight so a late-night session is not
+            // credited entirely to the day it started on.
+            var cursor = block.start
+            while cursor < block.end {
+                let dayStart = calendar.startOfDay(for: cursor)
+                let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? block.end
+                let chunkEnd = min(block.end, nextDay)
+                totals[dayStart, default: 0] += chunkEnd.timeIntervalSince(cursor)
+                cursor = chunkEnd
+            }
+        }
+        return totals
     }
 
     static func clippedDuration(_ segment: ActivitySegment, dayStart: Date, dayEnd: Date) -> TimeInterval {

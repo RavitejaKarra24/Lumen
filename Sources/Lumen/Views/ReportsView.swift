@@ -27,10 +27,16 @@ struct ReportsView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                Button("Export…") {
-                    appState.exportReportToDownloads()
+                Menu("Export…") {
+                    Button("Markdown (.md)") {
+                        appState.exportReportToDownloads(format: .markdown)
+                    }
+                    Button("Sessions as CSV (.csv)") {
+                        appState.exportReportToDownloads(format: .csv)
+                    }
                 }
-                .buttonStyle(.bordered)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
             }
             .padding(20)
 

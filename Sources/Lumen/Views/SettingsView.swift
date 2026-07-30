@@ -163,6 +163,11 @@ struct SettingsView: View {
                     }
                 ))
 
+                Toggle("Show current app in the menu bar", isOn: $appState.showMenuBarTitle)
+                Text("Off by default — the title changes on every app switch, which shifts everything else in your menu bar. A running focus session always shows its countdown.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 LabeledContent("Version") {
                     Text(versionString)
                         .foregroundStyle(.secondary)
@@ -174,12 +179,29 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                LabeledContent("Keep raw activity for") {
+                    Picker("Keep raw activity for", selection: $appState.retentionDays) {
+                        Text("Forever").tag(0)
+                        Text("30 days").tag(30)
+                        Text("90 days").tag(90)
+                        Text("1 year").tag(365)
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 180)
+                }
+                Text("Older sessions are deleted to keep the app fast. Generated reports are always kept.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack {
                     Button("Reveal Data Folder") {
                         appState.revealDataFolder()
                     }
                     Button("Refresh Analytics") {
                         appState.refreshAnalytics()
+                    }
+                    Button("Export CSV…") {
+                        appState.exportReportToDownloads(format: .csv)
                     }
                 }
             }

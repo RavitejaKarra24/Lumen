@@ -38,21 +38,21 @@ struct ActivityTimelineView: View {
                             message: "As you use your Mac, sessions will appear here for tagging and review."
                         )
                     } else {
+                        DayStrip(
+                            analytics: analytics,
+                            selection: $selectedSegmentID
+                        )
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 14)
+
+                        Divider()
+
                         List(segments, selection: $selectedSegmentID) { segment in
                             TimelineRow(segment: segment)
                                 .tag(segment.id)
                                 .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
                         }
                         .listStyle(.inset)
-                        .onChange(of: selectedSegmentID) { _, newValue in
-                            tagDraft = ""
-                            if let id = newValue,
-                               let segment = appState.analytics?.segments.first(where: { $0.id == id }) {
-                                notesDraft = segment.notes
-                            } else {
-                                notesDraft = ""
-                            }
-                        }
                     }
                 } else {
                     ProgressView()
@@ -64,11 +64,31 @@ struct ActivityTimelineView: View {
             detailPane
                 .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
         }
+        // Kept outside the list so it still fires when the list is not on screen.
+        .onChange(of: selectedSegmentID) { previous, newValue in
+            // Don't discard an edit just because the user clicked another session.
+            commitNotes(for: previous)
+            tagDraft = ""
+            notesDraft = newValue
+                .flatMap { id in appState.analytics?.segments.first(where: { $0.id == id }) }?
+                .notes ?? ""
+        }
+        .onDisappear { commitNotes(for: selectedSegmentID) }
         .onAppear {
             if selectedSegmentID == nil {
                 selectedSegmentID = appState.analytics?.segments.first(where: { !$0.isIdle })?.id
+                notesDraft = selectedSegment?.notes ?? ""
             }
         }
+    }
+
+    /// Saves the pending note draft if it actually differs from what is stored.
+    private func commitNotes(for segmentID: UUID?) {
+        guard let segmentID,
+              let segment = appState.analytics?.segments.first(where: { $0.id == segmentID }),
+              segment.notes != notesDraft
+        else { return }
+        appState.setNotes(notesDraft, for: segmentID)
     }
 
     @ViewBuilder
@@ -192,6 +212,119 @@ struct ActivityTimelineView: View {
         let value = tagDraft
         appState.addTag(value, to: segment.id)
         tagDraft = ""
+    }
+}
+
+/// A proportional 24-hour view of the day: where the time actually went, at a glance.
+struct DayStrip: View {
+    let analytics: DayAnalytics
+    @Binding var selection: UUID?
+
+    private let trackHeight: CGFloat = 34
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Day at a glance")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !analytics.deepWorkBlocks.isEmpty {
+                    Label(
+                        "\(analytics.deepWorkBlocks.count) deep-work block\(analytics.deepWorkBlocks.count == 1 ? "" : "s")",
+                        systemImage: "brain.head.profile"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                }
+            }
+
+            GeometryReader { geo in
+                let width = geo.size.width
+                ZStack(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.primary.opacity(0.05))
+
+                    // Deep-work blocks sit behind the segments as a soft band.
+                    ForEach(analytics.deepWorkBlocks) { block in
+                        let frame = span(block.start, block.end, width: width)
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.blue.opacity(0.16))
+                            .frame(width: frame.width, height: trackHeight)
+                            .offset(x: frame.x)
+                    }
+
+                    ForEach(analytics.segments) { segment in
+                        let frame = span(segment.startAt, segment.endAt ?? .now, width: width)
+                        if frame.width > 0.5 {
+                            Rectangle()
+                                .fill(color(for: segment))
+                                .frame(width: frame.width, height: segment.isIdle ? 8 : trackHeight)
+                                .offset(x: frame.x, y: segment.isIdle ? trackHeight - 8 : 0)
+                                .overlay(alignment: .leading) {
+                                    if segment.id == selection {
+                                        Rectangle()
+                                            .stroke(Color.primary, lineWidth: 1.5)
+                                            .frame(width: max(2, frame.width), height: trackHeight)
+                                            .offset(x: frame.x)
+                                    }
+                                }
+                                .onTapGesture { selection = segment.id }
+                                .help(tooltip(for: segment))
+                        }
+                    }
+
+                    // Hour ticks every three hours.
+                    ForEach(Array(stride(from: 0, through: 24, by: 3)), id: \.self) { hour in
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.12))
+                            .frame(width: 1, height: trackHeight)
+                            .offset(x: width * CGFloat(hour) / 24)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            .frame(height: trackHeight)
+
+            HStack(spacing: 0) {
+                ForEach(Array(stride(from: 0, to: 24, by: 3)), id: \.self) { hour in
+                    Text(hourLabel(hour))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private func span(_ start: Date, _ end: Date, width: CGFloat) -> (x: CGFloat, width: CGFloat) {
+        let total = analytics.dayEnd.timeIntervalSince(analytics.dayStart)
+        guard total > 0 else { return (0, 0) }
+        let clippedStart = max(start, analytics.dayStart)
+        let clippedEnd = min(end, analytics.dayEnd)
+        guard clippedEnd > clippedStart else { return (0, 0) }
+        let x = CGFloat(clippedStart.timeIntervalSince(analytics.dayStart) / total) * width
+        let w = CGFloat(clippedEnd.timeIntervalSince(clippedStart) / total) * width
+        // Keep very short sessions visible instead of collapsing them to nothing.
+        return (x, max(w, 1.5))
+    }
+
+    private func color(for segment: ActivitySegment) -> Color {
+        segment.isIdle ? Color.secondary.opacity(0.35) : segment.category.color.opacity(0.85)
+    }
+
+    private func tooltip(for segment: ActivitySegment) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        let label = segment.isIdle ? "Idle" : segment.displayTitle
+        return "\(formatter.string(from: segment.startAt)) · \(label) · \(DurationFormat.compact(segment.duration))"
+    }
+
+    private func hourLabel(_ hour: Int) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "ha"
+        let date = Calendar.current.date(byAdding: .hour, value: hour, to: analytics.dayStart) ?? analytics.dayStart
+        return formatter.string(from: date).lowercased()
     }
 }
 

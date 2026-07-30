@@ -34,7 +34,14 @@ enum SessionClassifier {
         "refactor", "debug", "build", "test", "swift", "typescript", "python",
     ]
 
-    static func classify(_ segment: ActivitySegment, contentText: String? = nil) -> (kind: SessionKind, topics: [String], category: ActivityCategory) {
+    /// - Parameter extractTopics: topic extraction runs an `NLTagger` pass, which is
+    ///   too slow for the recorder's polling loop. The recorder passes `false` and
+    ///   the intelligence cycle fills topics in later, off the hot path.
+    static func classify(
+        _ segment: ActivitySegment,
+        contentText: String? = nil,
+        extractTopics: Bool = true
+    ) -> (kind: SessionKind, topics: [String], category: ActivityCategory) {
         if segment.isIdle {
             return (.idle, [], segment.category)
         }
@@ -107,6 +114,10 @@ enum SessionClassifier {
         // Duration polish: long coding blocks are deep work.
         if category == .coding, segment.duration >= 15 * 60 {
             kind = .deepWork
+        }
+
+        guard extractTopics else {
+            return (kind, segment.topics, category)
         }
 
         let topicSources = [segment.windowTitle, segment.notes, segment.domain ?? "", contentText ?? ""]

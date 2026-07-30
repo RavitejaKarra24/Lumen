@@ -89,10 +89,13 @@ final class IntelligenceService {
             }
 
             // 1) Classify all day segments missing kind / refresh closed ones.
+            // Collected and written in one batch: a per-segment write rewrote the
+            // entire history once per segment.
             progressLabel = "Updating classifications…"
+            let contentByID = try await store.contentMap(for: daySegments.map(\.id))
+            var reclassified: [ActivitySegment] = []
             for segment in daySegments where !segment.isIdle {
-                let content = try await store.content(for: segment.id)
-                let result = SessionClassifier.classify(segment, contentText: content?.text)
+                let result = SessionClassifier.classify(segment, contentText: contentByID[segment.id]?.text)
                 var updated = segment
                 var dirty = false
                 if updated.sessionKind != result.kind {
@@ -108,9 +111,10 @@ final class IntelligenceService {
                     dirty = true
                 }
                 if dirty {
-                    try await store.replaceSegment(updated)
+                    reclassified.append(updated)
                 }
             }
+            try await store.replaceSegments(reclassified)
 
             // 2) Capture content for eligible browser segments.
             if autoCaptureEnabled || forceAll {

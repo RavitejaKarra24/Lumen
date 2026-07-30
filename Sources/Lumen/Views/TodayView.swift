@@ -17,6 +17,7 @@ struct TodayView: View {
                             categoriesCard(analytics)
                             focusCard(analytics)
                         }
+                        deepWorkCard(analytics)
                         appsCard(analytics)
                         sitesCard(analytics)
                         behaviourTeaser
@@ -190,6 +191,55 @@ struct TodayView: View {
         .padding(16)
         .frame(width: 260, alignment: .top)
         .background(cardBackground)
+    }
+
+    private func deepWorkCard(_ analytics: DayAnalytics) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Deep work blocks", systemImage: "brain.head.profile")
+                    .font(.headline)
+                Spacer()
+                Text(DurationFormat.compact(analytics.deepWorkDuration))
+                    .font(.callout.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.blue)
+            }
+
+            if analytics.deepWorkBlocks.isEmpty {
+                Text("No sustained blocks yet. Lumen counts a run of focused work lasting \(Int(AnalyticsService.deepWorkMinimumBlock / 60)) minutes or more — brief interruptions won’t break it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(analytics.deepWorkBlocks) { block in
+                    HStack(spacing: 12) {
+                        Image(systemName: block.isFocusSession ? "timer" : block.dominantCategory.symbolName)
+                            .foregroundStyle(block.isFocusSession ? Color.blue : block.dominantCategory.color)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(blockRange(block))
+                                .font(.body.monospacedDigit().weight(.medium))
+                            Text(block.appNames.isEmpty ? "—" : block.appNames.joined(separator: " · "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Text(DurationFormat.compact(block.focusedDuration))
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .padding(16)
+        .background(cardBackground)
+    }
+
+    private func blockRange(_ block: DeepWorkBlock) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return "\(formatter.string(from: block.start)) – \(formatter.string(from: block.end))"
     }
 
     private func appsCard(_ analytics: DayAnalytics) -> some View {

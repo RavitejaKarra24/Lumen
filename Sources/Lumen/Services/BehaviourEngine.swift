@@ -59,6 +59,7 @@ final class BehaviourEngine {
     private var focusClockTask: Task<Void, Never>?
     private var lastWarningSegmentID: UUID?
     private var lastNotificationAt: Date?
+    private var didSeedDefaults = false
 
     init(store: ActivityStore = .shared) {
         self.store = store
@@ -238,6 +239,8 @@ final class BehaviourEngine {
     }
 
     func seedDefaultsIfNeeded() async {
+        guard !didSeedDefaults else { return }
+        didSeedDefaults = true
         do {
             try await store.loadIfNeeded()
             let existingGoals = try await store.allGoals()
@@ -272,85 +275,36 @@ final class BehaviourEngine {
         }
 
         do {
-            try await store.loadIfNeeded()
             await seedDefaultsIfNeeded()
 
-            let allSegments = try await store.allSegments()
-            let focusSessions = try await store.allFocusSessions()
-            let insights = try await store.allInsights()
-            goals = try await store.allGoals()
-            projects = try await store.allProjects()
-            recentWarnings = try await store.recentWarnings(limit: 20)
+            // One hop to the store actor; all the heavy analysis happens there
+            // rather than on the main thread.
+            let inputs = try await store.behaviourInputs()
 
-            let (todayStart, todayEnd) = AnalyticsService.dayInterval(for: .now)
-            let todaySegments = allSegments.filter { segment in
-                let end = segment.endAt ?? .now
-                return segment.startAt < todayEnd && end >= todayStart
-            }
-            let todayAnalytics = AnalyticsService.analyze(
-                day: .now,
-                segments: allSegments,
-                focusSessions: focusSessions
-            )
+            goals = inputs.goals
+            projects = inputs.projects
+            recentWarnings = inputs.recentWarnings
 
-            let todayDeep = todayAnalytics.deepWorkDuration / 60
-            let todayCreation = minutes(of: todaySegments) {
-                $0.sessionKind == .creation || $0.sessionKind == .deepWork
-            }
-            let todayLearning = minutes(of: todaySegments) {
-                $0.sessionKind == .learning || $0.sessionKind == .research
-            }
-            let todayDistract = minutes(of: todaySegments) { $0.sessionKind == .distraction }
+            let todayDeep = inputs.todayAnalytics.deepWorkDuration / 60
+            let todayDistract = inputs.todayDistractionMinutes
 
             let goalProgress = goals.map { goal -> GoalProgress in
                 let current: Double
                 switch goal.metric {
                 case .deepWorkMinutes: current = todayDeep
-                case .creationMinutes: current = todayCreation
-                case .learningMinutes: current = todayLearning
-                case .focusScore: current = todayAnalytics.focusScore
+                case .creationMinutes: current = inputs.todayCreationMinutes
+                case .learningMinutes: current = inputs.todayLearningMinutes
+                case .focusScore: current = inputs.todayAnalytics.focusScore
                 case .maxDistractionMinutes: current = todayDistract
                 }
                 return GoalProgress(goal: goal, currentValue: current, unitLabel: goal.metric.unitLabel)
             }
 
-            let weekInterests = InterestDetector.detect(segments: allSegments.filter {
-                $0.startAt >= (Calendar.current.date(byAdding: .day, value: -7, to: .now) ?? .now)
-            })
-            let weekly = WeeklyPatternAnalyzer.analyze(
-                segments: allSegments,
-                endingOn: .now,
-                interests: weekInterests
-            )
-            let projectScores = ProjectScorer.score(
-                projects: projects,
-                segments: allSegments,
-                insights: insights
-            )
-
-            let insightCutoff = Calendar.current.date(byAdding: .day, value: -30, to: .now) ?? .distantPast
-            let openActions = insights.filter {
-                $0.kind == .actionItem && !$0.isCompleted && $0.createdAt >= insightCutoff
-            }
-            let openIdeas = insights.filter {
-                $0.kind == .idea && !$0.isCompleted && $0.createdAt >= insightCutoff
-            }
-            let recommendations = NextBuildEngine.recommend(
-                projectScores: projectScores,
-                interests: weekInterests,
-                ideas: openIdeas,
-                actions: openActions,
-                weekly: weekly
-            )
-
-            let streak = focusStreakDays(
-                segments: allSegments,
-                focusSessions: focusSessions
-            )
+            let streak = focusStreakDays(deepWorkByDay: inputs.deepWorkByDay)
 
             if triggerWarnings {
                 await maybeEmitDistractionWarning(
-                    todaySegments: todaySegments,
+                    openSegment: inputs.openSegment,
                     todayDistractMinutes: todayDistract,
                     goalProgress: goalProgress
                 )
@@ -363,13 +317,13 @@ final class BehaviourEngine {
             snapshot = BehaviourSnapshot(
                 generatedAt: .now,
                 goalProgress: goalProgress,
-                projectScores: projectScores,
-                weekly: weekly,
-                recommendations: recommendations,
+                projectScores: inputs.projectScores,
+                weekly: inputs.weekly,
+                recommendations: inputs.recommendations,
                 activeWarning: active,
                 todayDistractionMinutes: todayDistract,
                 todayDeepWorkMinutes: todayDeep,
-                todayCreationMinutes: todayCreation,
+                todayCreationMinutes: inputs.todayCreationMinutes,
                 focusStreakDays: streak
             )
         } catch {
@@ -378,7 +332,7 @@ final class BehaviourEngine {
     }
 
     private func maybeEmitDistractionWarning(
-        todaySegments: [ActivitySegment],
+        openSegment open: ActivitySegment?,
         todayDistractMinutes: Double,
         goalProgress: [GoalProgress]
     ) async {
@@ -388,14 +342,11 @@ final class BehaviourEngine {
         }
 
         // Snooze global if any warning still snoozed.
-        if let snoozed = recentWarnings.first(where: { ($0.snoozedUntil ?? .distantPast) > .now }) {
+        if recentWarnings.contains(where: { ($0.snoozedUntil ?? .distantPast) > .now }) {
             activeWarning = nil
-            _ = snoozed
             return
         }
 
-        // Current open distraction segment duration.
-        let open = todaySegments.last(where: { $0.endAt == nil })
         let currentIsDistraction = open.map {
             $0.sessionKind == .distraction || $0.category == .entertainment
         } ?? false
@@ -493,32 +444,24 @@ final class BehaviourEngine {
         segments.filter(pred).reduce(0.0) { $0 + $1.duration } / 60.0
     }
 
-    private func focusStreakDays(
-        segments: [ActivitySegment],
-        focusSessions: [FocusSession]
-    ) -> Int {
+    /// Consecutive days ending today that cleared the deep-work bar.
+    ///
+    /// Takes a precomputed per-day table: analysing the full history once per day
+    /// of the streak turned every refresh into thirty passes over every segment.
+    private func focusStreakDays(deepWorkByDay: [Date: TimeInterval]) -> Int {
         let cal = Calendar.current
         var streak = 0
         var day = cal.startOfDay(for: .now)
-        for _ in 0..<30 {
-            let dayAnalytics = AnalyticsService.analyze(
-                day: day,
-                segments: segments,
-                focusSessions: focusSessions,
-                calendar: cal
-            )
-            let deep = dayAnalytics.deepWorkDuration
-            if deep >= 30 * 60 {
+        for _ in 0..<365 {
+            if (deepWorkByDay[day] ?? 0) >= 30 * 60 {
                 streak += 1
-                day = cal.date(byAdding: .day, value: -1, to: day) ?? day
+            } else if streak == 0 && cal.isDateInToday(day) {
+                // Today may simply not be finished yet; don't break the streak on it.
             } else {
-                // Allow today to be incomplete without breaking if earlier days exist.
-                if streak == 0 && cal.isDateInToday(day) {
-                    day = cal.date(byAdding: .day, value: -1, to: day) ?? day
-                    continue
-                }
                 break
             }
+            guard let previous = cal.date(byAdding: .day, value: -1, to: day) else { break }
+            day = previous
         }
         return streak
     }

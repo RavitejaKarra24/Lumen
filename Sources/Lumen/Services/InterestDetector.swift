@@ -19,7 +19,10 @@ enum InterestDetector {
                 + segment.tags
 
             var topics = segment.topics
-            if topics.isEmpty {
+            // Topic extraction runs an NLTagger pass per segment. Skipping it for
+            // brief glances keeps a week of history cheap to re-scan; they are
+            // filtered out by the duration threshold below anyway.
+            if topics.isEmpty, segment.duration >= 60 {
                 topics = TopicExtractor.extract(from: sources, limit: 5)
             }
 

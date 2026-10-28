@@ -31,6 +31,9 @@ struct DeepWorkBlock: Identifiable, Sendable, Hashable {
     var span: TimeInterval { max(0, end.timeIntervalSince(start)) }
     /// Time actually spent on focused work inside the span.
     var focusedDuration: TimeInterval
+    /// The merged covered intervals behind `focusedDuration`, excluding the
+    /// brief interruptions bridged into the block's wall-clock span.
+    var focusedIntervals: [DateInterval]
     var dominantCategory: ActivityCategory
     var appNames: [String]
     /// True when an explicit focus session anchors the block.
@@ -301,10 +304,12 @@ enum AnalyticsService {
             guard run.isFocusSession || run.end.timeIntervalSince(run.start) >= minimumBlock else {
                 return nil
             }
+            let intervals = mergedIntervals(run.covered)
             return DeepWorkBlock(
                 start: run.start,
                 end: run.end,
-                focusedDuration: mergedDuration(run.covered),
+                focusedDuration: intervals.reduce(0) { $0 + $1.duration },
+                focusedIntervals: intervals,
                 dominantCategory: run.categoryTime.max(by: { $0.value < $1.value })?.key ?? .other,
                 appNames: run.appTime
                     .sorted { $0.value > $1.value }
@@ -315,26 +320,36 @@ enum AnalyticsService {
         }
     }
 
-    static func mergedDuration(_ intervals: [(start: Date, end: Date)]) -> TimeInterval {
+    /// Overlaps merged away; the result is the actual covered time, which is
+    /// what every deep-work total must count.
+    static func mergedIntervals(_ intervals: [(start: Date, end: Date)]) -> [DateInterval] {
         let sorted = intervals.sorted { $0.start < $1.start }
-        guard var current = sorted.first else { return 0 }
-        var total: TimeInterval = 0
+        guard var current = sorted.first else { return [] }
+        var merged: [DateInterval] = []
 
         for interval in sorted.dropFirst() {
             if interval.start <= current.end {
                 current.end = max(current.end, interval.end)
             } else {
-                total += current.end.timeIntervalSince(current.start)
+                merged.append(DateInterval(start: current.start, end: current.end))
                 current = interval
             }
         }
-        total += current.end.timeIntervalSince(current.start)
-        return total
+        merged.append(DateInterval(start: current.start, end: current.end))
+        return merged.filter { $0.duration > 0 }
+    }
+
+    static func mergedDuration(_ intervals: [(start: Date, end: Date)]) -> TimeInterval {
+        mergedIntervals(intervals).reduce(0) { $0 + $1.duration }
     }
 
     /// Deep-work seconds per calendar day across a whole history, in one pass.
     ///
-    /// Cheaper than running `analyze` once per day when computing streaks.
+    /// Cheaper than running `analyze` once per day when computing streaks, while
+    /// staying consistent with `analyze`: split the original focused spans at
+    /// midnight before merging and qualifying each day's blocks. In particular,
+    /// a focus-session anchor on one day must not waive the minimum block length
+    /// on another day. Merged covered intervals exclude interruptions from totals.
     static func deepWorkSecondsByDay(
         segments: [ActivitySegment],
         focusSessions: [FocusSession],
@@ -381,18 +396,29 @@ enum AnalyticsService {
             }
         }
 
-        var totals: [Date: TimeInterval] = [:]
-        for block in deepWorkBlocks(from: spans) {
-            // Split the block across midnight so a late-night session is not
-            // credited entirely to the day it started on.
-            var cursor = block.start
-            while cursor < block.end {
+        var spansByDay: [Date: [FocusedSpan]] = [:]
+        for span in spans {
+            var cursor = span.start
+            while cursor < span.end {
                 let dayStart = calendar.startOfDay(for: cursor)
-                let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? block.end
-                let chunkEnd = min(block.end, nextDay)
-                totals[dayStart, default: 0] += chunkEnd.timeIntervalSince(cursor)
+                let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? span.end
+                let chunkEnd = min(span.end, nextDay)
+                spansByDay[dayStart, default: []].append(
+                    FocusedSpan(
+                        start: cursor,
+                        end: chunkEnd,
+                        category: span.category,
+                        appName: span.appName,
+                        isFocusSession: span.isFocusSession
+                    )
+                )
                 cursor = chunkEnd
             }
+        }
+
+        var totals: [Date: TimeInterval] = [:]
+        for (day, daySpans) in spansByDay {
+            totals[day] = deepWorkBlocks(from: daySpans).reduce(0) { $0 + $1.focusedDuration }
         }
         return totals
     }

@@ -11,6 +11,8 @@ final class ActivityRecorder {
     private(set) var lastTickAt: Date?
     private(set) var secondsIdle: TimeInterval = 0
     private(set) var openSegmentID: UUID?
+    /// Last recording error, for surfacing in the UI instead of failing silently.
+    private(set) var lastError: String?
 
     var pollInterval: TimeInterval = 2.0
     var idleThreshold: TimeInterval = 120
@@ -24,6 +26,7 @@ final class ActivityRecorder {
     private let store: ActivityStore
     private var timer: Timer?
     private var transitionTask: Task<Void, Never>?
+    private var recordingSince: Date = .now
     private let inspector = BrowserInspector()
     private var idleDetector = IdleDetector(threshold: 120)
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -35,6 +38,7 @@ final class ActivityRecorder {
     func start() {
         guard !isRunning else { return }
         isRunning = true
+        recordingSince = .now
         idleDetector = IdleDetector(threshold: idleThreshold)
         installWorkspaceObservers()
         tick()
@@ -80,10 +84,9 @@ final class ActivityRecorder {
         currentSnapshot = snapshot
 
         let now = Date.now
-        // The user actually stopped working when input stopped, not when the
-        // threshold elapsed. Backdating keeps the idle threshold from being
-        // silently credited as active time on every single break.
-        let idleSince = idle ? now.addingTimeInterval(-secondsIdle) : now
+        // When input is idle, this is when the user actually stopped working —
+        // not the polling heartbeat, which only proves the recorder was running.
+        let lastInputAt = now.addingTimeInterval(-secondsIdle)
         transitionTask = Task { [weak self] in
             guard let self else { return }
             defer { self.transitionTask = nil }
@@ -91,49 +94,78 @@ final class ActivityRecorder {
                 try await self.store.loadIfNeeded()
                 let open = try await self.store.openSegment()
                 if idle {
-                    try await self.handleIdle(now: now, idleSince: idleSince, open: open)
+                    try await Self.recordIdle(
+                        now: now,
+                        idleSince: lastInputAt,
+                        recordingSince: self.recordingSince,
+                        minimumDuration: self.minimumSegmentDuration,
+                        observationInterval: self.observationInterval,
+                        store: self.store
+                    )
                 } else if let snapshot {
-                    try await self.handleActive(snapshot: snapshot, now: now, open: open)
+                    try await self.handleActive(snapshot: snapshot, now: now, lastInputAt: lastInputAt, open: open)
                 }
                 self.openSegmentID = try await self.store.openSegment()?.id
+                lastError = nil
             } catch {
-                // Keep running; surface later via AppState if needed.
+                lastError = error.localizedDescription
             }
         }
     }
 
-    private func handleIdle(now: Date, idleSince: Date, open: ActivitySegment?) async throws {
-        var idleStart = min(idleSince, now)
+    /// Where an active segment must end once input has gone idle: at the moment
+    /// input actually stopped, never before the segment began, never after now.
+    /// The pre-threshold heartbeat (crash-recovery metadata only) deliberately
+    /// does not participate — treating a polling observation as activity used to
+    /// credit up to a whole threshold of inactivity as work.
+    nonisolated static func idleCloseStart(openStart: Date, idleSince: Date, now: Date) -> Date {
+        max(openStart, min(idleSince, now))
+    }
 
-        if let open {
+    /// Reconcile in one store turn: no recorder/editor operation can interleave
+    /// between trimming active rows and inserting the replacement idle interval.
+    static func recordIdle(
+        now: Date,
+        idleSince: Date,
+        recordingSince: Date,
+        minimumDuration: TimeInterval,
+        observationInterval: TimeInterval,
+        store: isolated ActivityStore
+    ) throws {
+        // Input age can include time before launch, a manual pause, or sleep.
+        // That time is not ours to record or to remove from historical rows.
+        let idleStart = max(min(recordingSince, now), min(idleSince, now))
+        if let open = try store.openSegment() {
             if open.isIdle {
-                try await touch(open, at: now)
+                if now.timeIntervalSince(open.lastObservedAt ?? open.startAt) >= observationInterval {
+                    try store.updateObservation(id: open.id, at: now)
+                }
                 return
             }
-            // Never rewind the active segment before it began, or past work we
-            // already observed it doing.
-            idleStart = max(open.lastObservedAt ?? open.startAt, idleStart)
-            try await store.closeSegment(id: open.id, at: idleStart, minimumDuration: minimumSegmentDuration)
+            let closeAt = Self.idleCloseStart(openStart: open.startAt, idleSince: idleStart, now: now)
+            try store.closeSegment(id: open.id, at: closeAt, minimumDuration: minimumDuration)
         }
 
-        if try await store.openSegment() == nil {
-            let segment = ActivitySegment(
-                startAt: idleStart,
-                lastObservedAt: now,
-                appName: "Idle",
-                bundleIdentifier: "lumen.idle",
-                windowTitle: "Away",
-                isIdle: true,
-                category: .other,
-                sessionKind: .idle
-            )
-            try await store.insert(segment)
-        }
+        // Several app transitions can happen without input. Reconcile every
+        // overlapping active row, not just the latest one. The idle row begins
+        // at the same boundary, even if the latest active row began later.
+        try store.trimLastClosedSegment(to: idleStart)
+        try store.insert(ActivitySegment(
+            startAt: idleStart,
+            lastObservedAt: now,
+            appName: "Idle",
+            bundleIdentifier: "lumen.idle",
+            windowTitle: "Away",
+            isIdle: true,
+            category: .other,
+            sessionKind: .idle
+        ))
     }
 
     private func handleActive(
         snapshot: BrowserInspector.Snapshot,
         now: Date,
+        lastInputAt: Date,
         open: ActivitySegment?
     ) async throws {
         let domain = CategoryClassifier.domain(from: snapshot.urlString)
@@ -145,37 +177,67 @@ final class ActivityRecorder {
 
         if let open {
             if open.isIdle {
-                try await store.closeSegment(id: open.id, at: now, minimumDuration: minimumSegmentDuration)
+                // The user resumed input at `lastInputAt`; close the idle row and
+                // start this segment there instead of at the polling tick, so the
+                // tail of the break is not billed as work.
+                let resumeAt = max(open.startAt, min(lastInputAt, now))
+                try await store.closeSegment(id: open.id, at: resumeAt, minimumDuration: minimumSegmentDuration)
+                try await insertSegment(snapshot: snapshot, domain: domain, baseCategory: baseCategory, startAt: resumeAt)
+                return
             } else if sameContext(open, snapshot: snapshot) {
-                var updated = open
-                if updated.windowTitle != snapshot.windowTitle {
-                    updated.windowTitle = snapshot.windowTitle
-                }
-                if updated.urlString != snapshot.urlString {
-                    updated.urlString = snapshot.urlString
-                    updated.domain = domain
-                }
-                if now.timeIntervalSince(updated.lastObservedAt ?? updated.startAt) >= observationInterval {
-                    updated.lastObservedAt = now
-                }
-                // Lightweight live reclassify on title/url drift.
-                if updated != open {
-                    var probe = updated
-                    probe.category = baseCategory
-                    let classified = SessionClassifier.classify(probe, extractTopics: false)
-                    updated.category = classified.category
-                    updated.sessionKind = classified.kind
-                    updated.topics = classified.topics
-                    try await store.replaceSegment(updated)
-                }
+                try await Self.recordObservation(
+                    id: open.id, snapshot: snapshot, now: now,
+                    observationInterval: observationInterval, store: store
+                )
                 return
             } else {
                 try await store.closeSegment(id: open.id, at: now, minimumDuration: minimumSegmentDuration)
             }
         }
 
+        try await insertSegment(snapshot: snapshot, domain: domain, baseCategory: baseCategory, startAt: now)
+    }
+
+    /// Read live enrichment and apply the touch without an intervening actor
+    /// hop. A heartbeat is not new classification evidence.
+    static func recordObservation(
+        id: UUID,
+        snapshot: BrowserInspector.Snapshot,
+        now: Date,
+        observationInterval: TimeInterval,
+        store: isolated ActivityStore
+    ) throws {
+        guard var current = try store.segment(id: id), current.isOpen, !current.isIdle else { return }
+        let heartbeatDue = now.timeIntervalSince(current.lastObservedAt ?? current.startAt) >= observationInterval
+        guard current.windowTitle != snapshot.windowTitle || current.urlString != snapshot.urlString else {
+            if heartbeatDue { try store.updateObservation(id: id, at: now) }
+            return
+        }
+        current.windowTitle = snapshot.windowTitle
+        current.urlString = snapshot.urlString
+        current.domain = CategoryClassifier.domain(from: snapshot.urlString)
+        if heartbeatDue { current.lastObservedAt = now }
+        current.category = CategoryClassifier.classify(
+            bundleIdentifier: snapshot.bundleIdentifier, appName: snapshot.appName, domain: current.domain
+        )
+        let artifact = try store.content(for: id)
+        let contentText = artifact?.status == .ready && artifact?.urlString == snapshot.urlString ? artifact?.text : nil
+        let classified = SessionClassifier.classify(current, contentText: contentText, extractTopics: false)
+        try store.applyRecordingTouch(
+            id: id, windowTitle: current.windowTitle, urlString: current.urlString,
+            domain: current.domain, lastObservedAt: current.lastObservedAt,
+            category: classified.category, sessionKind: classified.kind, topics: classified.topics
+        )
+    }
+
+    private func insertSegment(
+        snapshot: BrowserInspector.Snapshot,
+        domain: String?,
+        baseCategory: ActivityCategory,
+        startAt: Date
+    ) async throws {
         var segment = ActivitySegment(
-            startAt: now,
+            startAt: startAt,
             appName: snapshot.appName,
             bundleIdentifier: snapshot.bundleIdentifier,
             windowTitle: snapshot.windowTitle,
@@ -221,13 +283,6 @@ final class ActivityRecorder {
         title.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func touch(_ segment: ActivitySegment, at date: Date) async throws {
-        guard date.timeIntervalSince(segment.lastObservedAt ?? segment.startAt) >= observationInterval else { return }
-        var updated = segment
-        updated.lastObservedAt = date
-        try await store.replaceSegment(updated)
-    }
-
     private func closeAfterPendingTransition(at date: Date) async {
         let pending = transitionTask
         await pending?.value
@@ -240,8 +295,9 @@ final class ActivityRecorder {
                 try await store.closeSegment(id: open.id, at: date, minimumDuration: minimumSegmentDuration)
             }
             openSegmentID = nil
+            lastError = nil
         } catch {
-            // ignore
+            lastError = error.localizedDescription
         }
     }
 
@@ -278,6 +334,7 @@ final class ActivityRecorder {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.recordingSince = .now
                 self?.tick()
             }
         }

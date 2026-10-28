@@ -3,7 +3,18 @@ import SwiftUI
 
 struct ReportsView: View {
     @Environment(AppState.self) private var appState
+
+    /// What the preview pane is showing. Live and placeholder states refresh
+    /// themselves when matching analytics arrives; a saved snapshot stays put
+    /// until another report or day is selected.
+    private enum PreviewSource: Equatable {
+        case savedSnapshot
+        case live
+        case placeholder
+    }
+
     @State private var previewMarkdown: String = ""
+    @State private var previewSource: PreviewSource = .placeholder
 
     var body: some View {
         @Bindable var appState = appState
@@ -18,25 +29,32 @@ struct ReportsView: View {
                     loadPreview()
                 }
                 Button("Generate") {
-                    let day = appState.selectedDay
-                    Task {
-                        if let snap = await appState.generateReport(for: day) {
-                            previewMarkdown = snap.markdown
-                        }
-                    }
+                    generateReport()
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(hasNoRawSessions)
 
                 Menu("Export…") {
-                    Button("Markdown (.md)") {
+                    Button("Saved report (.md)") {
+                        if let snapshot = savedSnapshot {
+                            appState.exportSavedReport(snapshot, format: .markdown)
+                        }
+                    }
+                    .disabled(savedSnapshot == nil)
+
+                    Button("Regenerate from sessions (.md)") {
                         appState.exportReportToDownloads(format: .markdown)
                     }
+                    .disabled(hasNoRawSessions)
+
                     Button("Sessions as CSV (.csv)") {
                         appState.exportReportToDownloads(format: .csv)
                     }
+                    .disabled(hasNoRawSessions)
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+                .help(hasNoRawSessions ? "Raw sessions for this day are gone; only the saved Markdown can be exported." : "")
             }
             .padding(20)
 
@@ -55,7 +73,7 @@ struct ReportsView: View {
                     } else {
                         List(appState.snapshots) { snap in
                             Button {
-                                previewMarkdown = snap.markdown
+                                showSnapshot(snap)
                                 appState.selectDay(snap.dayStart)
                             } label: {
                                 HStack {
@@ -87,28 +105,70 @@ struct ReportsView: View {
         .onChange(of: appState.selectedDay) { _, _ in
             loadPreview()
         }
-        .onChange(of: appState.analytics?.activeDuration) { _, _ in
-            // Keep live preview fresh when not looking at a stored snapshot exclusively.
-            if previewMarkdown.isEmpty {
-                loadPreview()
+        .onChange(of: appState.analyticsRevision) { _, _ in
+            refreshIfLive()
+        }
+        .onChange(of: appState.isRefreshing) { _, _ in
+            refreshIfLive()
+        }
+    }
+
+    private var savedSnapshot: DailySnapshot? {
+        let dayStart = Calendar.current.startOfDay(for: appState.selectedDay)
+        return appState.snapshots.first { Calendar.current.isDate($0.dayStart, inSameDayAs: dayStart) }
+    }
+
+    /// Raw sessions expired after retention — a regenerated export would not
+    /// match what the user is looking at.
+    private var hasNoRawSessions: Bool {
+        guard let analytics = appState.analytics,
+              Calendar.current.isDate(analytics.dayStart, inSameDayAs: appState.selectedDay)
+        else { return true }
+        return analytics.segments.isEmpty
+    }
+
+    private func generateReport() {
+        let day = appState.selectedDay
+        Task {
+            if let snap = await appState.generateReport(for: day) {
+                // Guard against the user having moved to another day while the
+                // report was generated.
+                guard Calendar.current.isDate(day, inSameDayAs: appState.selectedDay) else { return }
+                previewMarkdown = snap.markdown
+                previewSource = .savedSnapshot
             }
         }
     }
 
+    private func showSnapshot(_ snap: DailySnapshot) {
+        previewMarkdown = snap.markdown
+        previewSource = .savedSnapshot
+    }
+
     private func loadPreview() {
-        let dayStart = Calendar.current.startOfDay(for: appState.selectedDay)
-        if let existing = appState.snapshots.first(where: { Calendar.current.isDate($0.dayStart, inSameDayAs: dayStart) }) {
-            previewMarkdown = existing.markdown
+        if let snapshot = savedSnapshot {
+            previewMarkdown = snapshot.markdown
+            previewSource = .savedSnapshot
             return
         }
+        previewSource = .live
         if let analytics = appState.analytics,
-           Calendar.current.isDate(analytics.dayStart, inSameDayAs: dayStart) {
+           Calendar.current.isDate(analytics.dayStart, inSameDayAs: appState.selectedDay) {
             previewMarkdown = ReportGenerator.markdown(for: analytics)
         } else if appState.isRefreshing {
             previewMarkdown = "_Loading this day’s activity…_"
+            previewSource = .placeholder
         } else {
             previewMarkdown = "_No data for this day yet._"
+            previewSource = .placeholder
         }
+    }
+
+    /// Live and loading previews follow analytics updates; a stored snapshot
+    /// must not be replaced by a background refresh.
+    private func refreshIfLive() {
+        guard previewSource != .savedSnapshot else { return }
+        loadPreview()
     }
 
     private func dayLabel(_ date: Date) -> String {

@@ -1,9 +1,9 @@
 import AppKit
-import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         @Bindable var appState = appState
@@ -122,13 +122,15 @@ struct SettingsView: View {
                     .frame(maxWidth: 260)
                 }
 
-                Text("Fetches page text and YouTube captions for longer browser sessions. Content stays on this Mac.")
+                Text("When enabled, Lumen makes network requests to the sites you visit (and YouTube) to fetch page text and captions for longer browser sessions. Only titles, URLs, and the fetched text are stored, and everything stays on this Mac. With it off, the Intelligence page runs local analysis only until you choose Fetch content there.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
                 Button("Run intelligence now") {
                     Task { await appState.runIntelligence() }
                 }
+
+                MutedTopicsRow()
             }
 
             Section("Permissions") {
@@ -156,12 +158,24 @@ struct SettingsView: View {
 
             Section("General") {
                 Toggle("Launch at login", isOn: Binding(
-                    get: { appState.launchAtLogin },
+                    get: { appState.loginItem.isEnabled },
                     set: { newValue in
-                        appState.launchAtLogin = newValue
-                        updateLoginItem(enabled: newValue)
+                        appState.loginItem.setEnabled(newValue)
+                        if let error = appState.loginItem.lastError {
+                            appState.setStatus(error)
+                        }
                     }
                 ))
+                .disabled(!appState.loginItem.canManage)
+                Text(appState.loginItem.statusDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if appState.loginItem.needsApproval {
+                    Button("Open Login Items Settings") {
+                        appState.loginItem.openApprovalSettings()
+                    }
+                }
 
                 Toggle("Show current app in the menu bar", isOn: $appState.showMenuBarTitle)
                 Text("Off by default — the title changes on every app switch, which shifts everything else in your menu bar. A running focus session always shows its countdown.")
@@ -209,6 +223,14 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding()
         .navigationTitle("Settings")
+        .onAppear {
+            // Reconcile with the actual login-item service, in case it changed
+            // outside the app since the last visit.
+            appState.loginItem.refresh()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { appState.loginItem.refresh() }
+        }
     }
 
     private var versionString: String {
@@ -216,21 +238,49 @@ struct SettingsView: View {
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         return "\(v) (\(b))"
     }
+}
 
-    private func updateLoginItem(enabled: Bool) {
-        #if DEBUG
-        // Avoid polluting login items during iterative development.
-        return
-        #else
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
+/// Undo/reset controls for the insight mute and dismissal state.
+private struct MutedTopicsRow: View {
+    @Environment(AppState.self) private var appState
+    @State private var mutedCount = 0
+    @State private var hasDismissed = false
+
+    var body: some View {
+        HStack {
+            if mutedCount > 0 {
+                Button("Reset \(mutedCount) muted topic\(mutedCount == 1 ? "" : "s")") {
+                    Task {
+                        await appState.resetMutedTopics()
+                        await refresh()
+                    }
+                }
             }
-        } catch {
-            appState.statusMessage = "Login item failed: \(error.localizedDescription)"
+            if hasDismissed {
+                Button("Restore dismissed insights") {
+                    Task {
+                        await appState.resetDismissedInsights()
+                        await refresh()
+                    }
+                }
+            }
         }
-        #endif
+        // Attach to an unconditional container: the counts begin at zero, so
+        // a task inside the conditional controls would never get to load them.
+        .task { await refresh() }
+        .onChange(of: appState.insights) { _, _ in
+            Task { await refresh() }
+        }
+    }
+
+    private func refresh() async {
+        do {
+            // This read also ensures persisted mute state has been loaded.
+            let dismissed = try await appState.store.dismissedInsightCount()
+            mutedCount = await appState.store.mutedTopics.count
+            hasDismissed = dismissed > 0
+        } catch {
+            appState.setStatus(error.localizedDescription)
+        }
     }
 }

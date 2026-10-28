@@ -156,13 +156,15 @@ A locally built app is never quarantined, so you will not see the security promp
 
 ```bash
 swift build                                 # compile only
+swift build -c release                      # production compile
+swift run --package-path Tests LumenTests    # sequential regression checks
 Scripts/run.sh                              # build, sign locally, and launch
 Scripts/package_app.sh release              # build Lumen.app at the repo root
 Scripts/package_zip.sh                      # regenerate the downloadable Lumen.zip
 ./install.sh                                # build and install to ~/Applications
 ```
 
-There is no test target yet. CI (`.github/workflows/ci.yml`) builds the app on every push, ad-hoc signs it, and verifies the bundle and the zip.
+The regression harness is a separate Swift package in `Tests/`, so normal app builds never compile its debug-only `@testable` imports. It uses plain Swift checks without requiring XCTest or Swift Testing. CI (`.github/workflows/ci.yml`) runs it before building, ad-hoc signing, and verifying the app bundle and committed zip. No project-wide formatter/linter configuration is defined yet.
 
 `Scripts/run.sh` and `install.sh` use a persistent local signing identity created by `Scripts/setup_local_signing.sh`, which keeps an Accessibility approval valid across ordinary rebuilds. To package with a real Apple identity instead:
 
@@ -199,10 +201,12 @@ git add Lumen.zip version.env
 ## Layout
 
 ```text
-Sources/Lumen/App/        app lifecycle and UI-owned state
-Sources/Lumen/Views/      SwiftUI dashboard, onboarding, menu bar, settings
-Sources/Lumen/Models/     activity, intelligence, and behaviour data
-Sources/Lumen/Services/   recording, browser inspection, persistence, insights, goals
+Sources/Lumen/           thin executable entry point
+Sources/LumenKit/App/    app lifecycle and UI-owned state
+Sources/LumenKit/Views/  SwiftUI dashboard, onboarding, menu bar, settings
+Sources/LumenKit/Models/ activity, intelligence, and behaviour data
+Sources/LumenKit/Services/ recording, browser inspection, persistence, insights, goals
+Tests/                   standalone regression harness package
 Scripts/                  build, icon, signing, packaging
 Assets/AppIcon.svg        icon source; Icon.icns is generated from it
 app.env                   app name, bundle id, minimum OS

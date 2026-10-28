@@ -43,7 +43,8 @@ done
 # Pass every architecture to a single invocation so SwiftPM emits one universal
 # binary. Building each architecture in its own invocation does not work: both
 # builds resolve to the same bin path, so the second overwrites the first.
-swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" "${ARCH_ARGS[@]}"
+# Build only the shipping app product, not any other package products.
+swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" "${ARCH_ARGS[@]}" --product "$APP_NAME"
 BIN_DIR="$(swift build "${BUILD_SYSTEM_ARGS[@]}" -c "$CONF" "${ARCH_ARGS[@]}" --show-bin-path)"
 BINARY="$BIN_DIR/$APP_NAME"
 if [[ ! -f "$BINARY" ]]; then

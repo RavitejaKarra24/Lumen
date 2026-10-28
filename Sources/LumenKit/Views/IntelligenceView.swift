@@ -34,8 +34,11 @@ struct IntelligenceView: View {
         }
         .navigationTitle("Intelligence")
         .onAppear {
+            // A view appearing never triggers network requests: run local
+            // analysis only. Fetching happens through the capture preference or
+            // the explicit "Fetch content" action.
             if intel.report(for: appState.selectedDay) == nil {
-                Task { await appState.runIntelligence(for: appState.selectedDay) }
+                Task { await appState.runIntelligence(for: appState.selectedDay, mode: .localOnly) }
             }
         }
     }
@@ -52,10 +55,18 @@ struct IntelligenceView: View {
             Spacer()
             DayPickerBar(day: $appState.selectedDay) { day in
                 appState.selectDay(day)
-                Task { await appState.runIntelligence(for: day) }
+                Task { await appState.runIntelligence(for: day, mode: .localOnly) }
             }
             Button {
-                Task { await appState.runIntelligence(for: appState.selectedDay) }
+                Task { await appState.runIntelligence(for: appState.selectedDay, mode: .full) }
+            } label: {
+                Label("Fetch content", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(intel.isRunning)
+            .help("Fetch page text and transcripts for this day, even with auto-capture off")
+            Button {
+                Task { await appState.runIntelligence(for: appState.selectedDay, mode: .automatic) }
             } label: {
                 if intel.isRunning {
                     ProgressView()
@@ -188,8 +199,16 @@ struct IntelligenceView: View {
     private var classifiedCard: some View {
         let segments = appState.analytics?.segments.filter { !$0.isIdle } ?? []
         var counts: [SessionKind: TimeInterval] = [:]
+        // Clipped to the selected day, matching every other daily total: a
+        // session crossing midnight contributes only its portion of this day.
+        let dayStart = appState.analytics?.dayStart ?? .distantPast
+        let dayEnd = appState.analytics?.dayEnd ?? .distantFuture
         for segment in segments {
-            counts[segment.sessionKind, default: 0] += segment.duration
+            counts[segment.sessionKind, default: 0] += AnalyticsService.clippedDuration(
+                segment,
+                dayStart: dayStart,
+                dayEnd: dayEnd
+            )
         }
         let rows = counts
             .map { (kind: $0.key, duration: $0.value) }
@@ -255,6 +274,13 @@ struct IntelligenceView: View {
                         appState.toggleInsightPinned(item)
                     } onDelete: {
                         appState.deleteInsight(item)
+                    }
+                    .contextMenu {
+                        Button("Mute “\(item.title)” permanently") {
+                            appState.muteTopic(of: item)
+                        }
+                        Text("Delete only dismisses this day’s occurrence; muting suppresses the topic on every day.")
+                            .font(.caption)
                     }
                 }
             }

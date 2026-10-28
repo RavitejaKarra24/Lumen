@@ -5,9 +5,18 @@ on:
   pull_request:
 
 jobs:
+  tests:
+    name: Regression harness
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run LumenTests
+        run: swift run --package-path Tests LumenTests
+
   download:
     name: Verify the committed download
     runs-on: macos-latest
+    needs: tests
     steps:
       - uses: actions/checkout@v4
       # The zip is a build artifact living in source control, so nothing else
@@ -18,23 +27,29 @@ jobs:
           set -euo pipefail
           source version.env
           VERIFY_DIR="$(mktemp -d)"
+          trap 'rm -rf "$VERIFY_DIR"' EXIT
           /usr/bin/ditto -x -k Lumen.zip "$VERIFY_DIR"
           APP="$VERIFY_DIR/Lumen.app"
           test -x "$APP/Contents/MacOS/Lumen"
           plutil -lint "$APP/Contents/Info.plist"
           codesign --verify --deep --strict --verbose=2 "$APP"
-          lipo -archs "$APP/Contents/MacOS/Lumen"
+          ARCHES="$(lipo -archs "$APP/Contents/MacOS/Lumen")"
+          for arch in arm64 x86_64; do
+            [[ " $ARCHES " == *" $arch "* ]] || { echo "Missing $arch" >&2; exit 1; }
+          done
+          ZIP_BUILD="$(plutil -extract CFBundleVersion raw -o - "$APP/Contents/Info.plist")"
           ZIP_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
-          if [[ "$ZIP_VERSION" != "$MARKETING_VERSION" ]]; then
-            echo "ERROR: Lumen.zip is stale. It contains $ZIP_VERSION, version.env says $MARKETING_VERSION." >&2
+          if [[ "$ZIP_VERSION" != "$MARKETING_VERSION" || "$ZIP_BUILD" != "$BUILD_NUMBER" ]]; then
+            echo "ERROR: Lumen.zip is stale. It contains $ZIP_VERSION ($ZIP_BUILD), version.env says $MARKETING_VERSION ($BUILD_NUMBER)." >&2
             echo "Run Scripts/package_zip.sh and commit the result." >&2
             exit 1
           fi
-          echo "Committed download is version $ZIP_VERSION."
+          echo "Committed download is version $ZIP_VERSION ($ZIP_BUILD)."
 
   package:
     name: Build, sign, and archive
     runs-on: macos-latest
+    needs: tests
     steps:
       - uses: actions/checkout@v4
       - name: Build, ad-hoc sign, and archive

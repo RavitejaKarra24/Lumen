@@ -4,7 +4,6 @@ struct ActivityTimelineView: View {
     @Environment(AppState.self) private var appState
     @State private var selectedSegmentID: UUID?
     @State private var tagDraft = ""
-    @State private var notesDraft = ""
     @State private var hideIdle = true
 
     private var selectedSegment: ActivitySegment? {
@@ -48,9 +47,13 @@ struct ActivityTimelineView: View {
                         Divider()
 
                         List(segments, selection: $selectedSegmentID) { segment in
-                            TimelineRow(segment: segment)
-                                .tag(segment.id)
-                                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                            TimelineRow(
+                                segment: segment,
+                                dayStart: analytics.dayStart,
+                                dayEnd: analytics.dayEnd
+                            )
+                            .tag(segment.id)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
                         }
                         .listStyle(.inset)
                     }
@@ -65,30 +68,29 @@ struct ActivityTimelineView: View {
                 .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
         }
         // Kept outside the list so it still fires when the list is not on screen.
-        .onChange(of: selectedSegmentID) { previous, newValue in
-            // Don't discard an edit just because the user clicked another session.
+        .onChange(of: selectedSegmentID) { previous, _ in
             commitNotes(for: previous)
             tagDraft = ""
-            notesDraft = newValue
-                .flatMap { id in appState.analytics?.segments.first(where: { $0.id == id }) }?
-                .notes ?? ""
+        }
+        .onChange(of: appState.selectedDay) { _, _ in
+            // Drafts are keyed by session and survive analytics/day changes.
+            commitNotes(for: selectedSegmentID)
+        }
+        .onChange(of: appState.analytics?.segments) { _, segments in
+            appState.noteDrafts.reconcile(with: segments ?? [])
         }
         .onDisappear { commitNotes(for: selectedSegmentID) }
         .onAppear {
             if selectedSegmentID == nil {
                 selectedSegmentID = appState.analytics?.segments.first(where: { !$0.isIdle })?.id
-                notesDraft = selectedSegment?.notes ?? ""
             }
         }
     }
 
-    /// Saves the pending note draft if it actually differs from what is stored.
     private func commitNotes(for segmentID: UUID?) {
-        guard let segmentID,
-              let segment = appState.analytics?.segments.first(where: { $0.id == segmentID }),
-              segment.notes != notesDraft
-        else { return }
-        appState.setNotes(notesDraft, for: segmentID)
+        appState.noteDrafts.save(for: segmentID) { text, id in
+            await appState.setNotes(text, for: id)
+        }
     }
 
     @ViewBuilder
@@ -110,8 +112,21 @@ struct ActivityTimelineView: View {
                         Text(timeRange(segment))
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
-                        Text(DurationFormat.compact(segment.duration))
+                        // The portion of this session that belongs to the
+                        // selected day, with the full span called out when the
+                        // session reaches past midnight.
+                        let dayPortion = AnalyticsService.clippedDuration(
+                            segment,
+                            dayStart: appState.analytics?.dayStart ?? .distantPast,
+                            dayEnd: appState.analytics?.dayEnd ?? .distantFuture
+                        )
+                        Text(DurationFormat.compact(dayPortion))
                             .font(.title3.monospacedDigit())
+                        if segment.duration - dayPortion > 1 {
+                            Text("Full session: \(DurationFormat.compact(segment.duration))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
                     }
 
                     if let url = segment.urlString {
@@ -167,13 +182,16 @@ struct ActivityTimelineView: View {
                     }
 
                     group("Notes") {
-                        TextEditor(text: $notesDraft)
+                        TextEditor(text: Binding(
+                            get: { appState.noteDrafts.text(for: segment.id, stored: segment.notes) },
+                            set: { appState.noteDrafts.edit($0, for: segment.id, stored: segment.notes) }
+                        ))
                             .font(.body)
                             .frame(minHeight: 100)
                             .padding(6)
                             .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                         Button("Save notes") {
-                            appState.setNotes(notesDraft, for: segment.id)
+                            commitNotes(for: segment.id)
                         }
                         .buttonStyle(.bordered)
                     }
@@ -317,7 +335,12 @@ struct DayStrip: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
         let label = segment.isIdle ? "Idle" : segment.displayTitle
-        return "\(formatter.string(from: segment.startAt)) · \(label) · \(DurationFormat.compact(segment.duration))"
+        let dayDuration = AnalyticsService.clippedDuration(
+            segment,
+            dayStart: analytics.dayStart,
+            dayEnd: analytics.dayEnd
+        )
+        return "\(formatter.string(from: segment.startAt)) · \(label) · \(DurationFormat.compact(dayDuration))"
     }
 
     private func hourLabel(_ hour: Int) -> String {
@@ -330,6 +353,14 @@ struct DayStrip: View {
 
 struct TimelineRow: View {
     let segment: ActivitySegment
+    var dayStart: Date = .distantPast
+    var dayEnd: Date = .distantFuture
+
+    /// The portion of the session belonging to the selected day, matching how
+    /// analytics counts it.
+    private var dayDuration: TimeInterval {
+        AnalyticsService.clippedDuration(segment, dayStart: dayStart, dayEnd: dayEnd)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -344,7 +375,7 @@ struct TimelineRow: View {
                         .font(.body.weight(.medium))
                         .lineLimit(1)
                     Spacer()
-                    Text(DurationFormat.compact(segment.duration))
+                    Text(DurationFormat.compact(dayDuration))
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }

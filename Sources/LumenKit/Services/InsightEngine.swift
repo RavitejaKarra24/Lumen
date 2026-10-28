@@ -24,18 +24,45 @@ enum InsightEngine {
 
     static func analyze(
         dayStart: Date,
+        dayEnd: Date,
         segments: [ActivitySegment],
         contentBySegment: [UUID: ContentArtifact]
     ) -> (report: IntelligenceReport, insights: [InsightRecord]) {
-        let active = segments.filter { !$0.isIdle }
+        // Feed every duration-based consumer the same day-clipped evidence,
+        // including interest weighting. Boundary-only rows must not generate
+        // counts, highlights, or tasks for a day with no activity from them.
+        let now = Date.now
+        let active = segments.compactMap { segment -> ActivitySegment? in
+            guard !segment.isIdle else { return nil }
+            let start = max(segment.startAt, dayStart)
+            let end = min(segment.endAt ?? now, dayEnd)
+            guard end > start else { return nil }
+            var clipped = segment
+            clipped.startAt = start
+            clipped.endAt = end
+            return clipped
+        }
+        let activeIDs = Set(active.map(\.id))
+        let contentBySegment = contentBySegment.filter { activeIDs.contains($0.key) }
 
         let interests = InterestDetector.detect(segments: active, contentBySegment: contentBySegment)
         let learningSegments = active.filter {
             $0.sessionKind == .learning || $0.sessionKind == .research || $0.category == .learning
         }
 
-        let learningSummary = buildLearningSummary(learningSegments: learningSegments, contentBySegment: contentBySegment, interests: interests)
-        let extracted = extractIdeasAndActions(segments: active, contentBySegment: contentBySegment, dayStart: dayStart)
+        let learningSummary = buildLearningSummary(
+            learningSegments: learningSegments,
+            contentBySegment: contentBySegment,
+            interests: interests,
+            dayStart: dayStart,
+            dayEnd: dayEnd
+        )
+        let extracted = extractIdeasAndActions(
+            segments: active,
+            contentBySegment: contentBySegment,
+            dayStart: dayStart,
+            dayEnd: dayEnd
+        )
 
         var kindCounts: [SessionKind: Int] = [:]
         for segment in active {
@@ -97,13 +124,21 @@ enum InsightEngine {
     private static func buildLearningSummary(
         learningSegments: [ActivitySegment],
         contentBySegment: [UUID: ContentArtifact],
-        interests: [InterestSignal]
+        interests: [InterestSignal],
+        dayStart: Date,
+        dayEnd: Date
     ) -> String {
         guard !learningSegments.isEmpty else {
             return "No clear learning sessions yet today. Visit docs, courses, or educational videos and Lumen will summarize them here."
         }
 
-        let total = learningSegments.reduce(0.0) { $0 + $1.duration }
+        // Durations are clipped to the selected day, matching every other
+        // headline metric: a session crossing midnight counts only its portion.
+        func clippedDuration(_ segment: ActivitySegment) -> TimeInterval {
+            AnalyticsService.clippedDuration(segment, dayStart: dayStart, dayEnd: dayEnd)
+        }
+
+        let total = learningSegments.reduce(0.0) { $0 + clippedDuration($1) }
         var lines: [String] = []
         lines.append(
             "You spent \(DurationFormat.compact(total)) on learning/research across \(learningSegments.count) session\(learningSegments.count == 1 ? "" : "s")."
@@ -115,13 +150,13 @@ enum InsightEngine {
         }
 
         // Highlight notable sessions
-        let notable = learningSegments.sorted { $0.duration > $1.duration }.prefix(5)
+        let notable = learningSegments.sorted { clippedDuration($0) > clippedDuration($1) }.prefix(5)
         if !notable.isEmpty {
             lines.append("")
             lines.append("Highlights:")
             for segment in notable {
                 let label = segment.windowTitle.isEmpty ? (segment.domain ?? segment.appName) : segment.windowTitle
-                var line = "- \(DurationFormat.compact(segment.duration)) — \(label)"
+                var line = "- \(DurationFormat.compact(clippedDuration(segment))) — \(label)"
                 if let summary = segment.contentSummary, !summary.isEmpty {
                     line += " — \(summary)"
                 } else if let content = contentBySegment[segment.id], !content.text.isEmpty {
@@ -168,7 +203,8 @@ enum InsightEngine {
     private static func extractIdeasAndActions(
         segments: [ActivitySegment],
         contentBySegment: [UUID: ContentArtifact],
-        dayStart: Date
+        dayStart: Date,
+        dayEnd: Date
     ) -> (ideas: [InsightRecord], actions: [InsightRecord]) {
         var ideas: [InsightRecord] = []
         var actions: [InsightRecord] = []
@@ -233,8 +269,9 @@ enum InsightEngine {
             }
 
             // Title-based soft ideas for long learning sessions.
+            let dayPortion = AnalyticsService.clippedDuration(segment, dayStart: dayStart, dayEnd: dayEnd)
             if segment.sessionKind == .learning || segment.sessionKind == .research,
-               segment.duration >= 8 * 60,
+               dayPortion >= 8 * 60,
                !segment.windowTitle.isEmpty {
                 let title = segment.windowTitle
                 let key = "learn:\(title.lowercased())"
@@ -244,7 +281,7 @@ enum InsightEngine {
                             dayStart: dayStart,
                             kind: .idea,
                             title: "Explore further: \(title)",
-                            body: "You spent \(DurationFormat.compact(segment.duration)) here — consider turning it into a note or prototype.",
+                            body: "You spent \(DurationFormat.compact(dayPortion)) here — consider turning it into a note or prototype.",
                             confidence: 0.45,
                             topics: segment.topics,
                             sourceSegmentIDs: [segment.id]

@@ -41,7 +41,8 @@ enum CategoryClassifier {
         "dev.warp.Warp-Stable",
         "com.panic.Nova",
         "com.panic.Transmit",
-        "com.figma.Desktop",
+        // Figma is intentionally absent: it lives in designBundles, and listing it
+        // here too made coding win by check order on an unambiguous design app.
     ]
 
     private static let communicationBundles: Set<String> = [

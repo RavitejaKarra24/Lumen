@@ -14,15 +14,35 @@ final class LumenAppDelegate: NSObject, NSApplicationDelegate {
         let done = DispatchSemaphore(value: 0)
         Task.detached(priority: .userInitiated) {
             let store = ActivityStore.shared
-            try? await store.closeOpenSegment(at: .now, minimumDuration: 1.5)
-            await store.flush()
+            do {
+                try await store.closeOpenSegment(at: .now, minimumDuration: 1.5)
+            } catch {
+                NSLog("Lumen could not close the final session: %@", error.localizedDescription)
+            }
+            // Attempt pending writes even if closing the session failed. Health
+            // is in-memory only; a failure here is not retained after exit.
+            do {
+                try await store.flush()
+            } catch {
+                NSLog("Lumen could not save pending data before exit: %@", error.localizedDescription)
+            }
             done.signal()
         }
-        _ = done.wait(timeout: .now() + 4)
+        if done.wait(timeout: .now() + 4) == .timedOut {
+            NSLog("Lumen timed out saving pending data before exit")
+        }
     }
 }
 
-@main
+/// Entry hook for the thin executable target: all app code lives in this
+/// library so the LumenTests harness can import and exercise it directly.
+public enum LumenEntry {
+    @MainActor
+    public static func run() {
+        LumenApp.main()
+    }
+}
+
 struct LumenApp: App {
     @NSApplicationDelegateAdaptor(LumenAppDelegate.self) private var appDelegate
     @State private var appState = AppState()

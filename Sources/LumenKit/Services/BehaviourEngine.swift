@@ -310,8 +310,10 @@ final class BehaviourEngine {
                 )
             }
 
-            // Pick latest active warning
-            let active = recentWarnings.first(where: \.isActive)
+            // Pick the displayed warning through the single eligibility rule, so
+            // disabling warnings or a global snooze can never be bypassed by a
+            // different active warning sitting in the list.
+            let active = displayableWarning(from: recentWarnings)
             activeWarning = active
 
             snapshot = BehaviourSnapshot(
@@ -326,9 +328,19 @@ final class BehaviourEngine {
                 todayCreationMinutes: inputs.todayCreationMinutes,
                 focusStreakDays: streak
             )
+            lastError = nil
         } catch {
-            // Keep last snapshot
+            lastError = "Behaviour evaluation failed: \(error.localizedDescription)"
         }
+    }
+
+    /// The one rule for what may be shown right now: nothing while warnings are
+    /// disabled, nothing while any warning holds a global snooze, otherwise the
+    /// newest still-active warning. Used for both display and auto-dismissal.
+    private func displayableWarning(from warnings: [BehaviourWarning]) -> BehaviourWarning? {
+        guard warningsEnabled else { return nil }
+        if warnings.contains(where: { ($0.snoozedUntil ?? .distantPast) > .now }) { return nil }
+        return warnings.first(where: \.isActive)
     }
 
     private func maybeEmitDistractionWarning(
@@ -336,14 +348,10 @@ final class BehaviourEngine {
         todayDistractMinutes: Double,
         goalProgress: [GoalProgress]
     ) async {
-        guard warningsEnabled else {
-            activeWarning = nil
-            return
-        }
+        guard warningsEnabled else { return }
 
         // Snooze global if any warning still snoozed.
         if recentWarnings.contains(where: { ($0.snoozedUntil ?? .distantPast) > .now }) {
-            activeWarning = nil
             return
         }
 
@@ -404,16 +412,17 @@ final class BehaviourEngine {
         }
 
         guard shouldWarn else {
-            if let activeWarning, activeWarning.segmentID != nil {
-                await dismissWarning(activeWarning)
+            // The condition cleared: retire the warning that was being shown,
+            // through the same eligibility rule that selected it.
+            if let shown = displayableWarning(from: recentWarnings), shown.segmentID != nil {
+                await dismissWarning(shown)
             }
             return
         }
 
-        if let existing = recentWarnings.first(where: {
+        if recentWarnings.contains(where: {
             $0.title == title && $0.isActive && Date().timeIntervalSince($0.createdAt) < 60 * 60
         }) {
-            activeWarning = existing
             return
         }
 
@@ -421,7 +430,6 @@ final class BehaviourEngine {
         if let segmentID, segmentID == lastWarningSegmentID,
            let last = recentWarnings.first,
            Date().timeIntervalSince(last.createdAt) < 10 * 60 {
-            activeWarning = last.isActive ? last : activeWarning
             return
         }
 
@@ -435,13 +443,8 @@ final class BehaviourEngine {
         )
         try? await store.upsertWarning(warning)
         recentWarnings = (try? await store.recentWarnings(limit: 20)) ?? [warning]
-        activeWarning = warning
         lastWarningSegmentID = segmentID
         postNotification(warning)
-    }
-
-    private func minutes(of segments: [ActivitySegment], where pred: (ActivitySegment) -> Bool) -> Double {
-        segments.filter(pred).reduce(0.0) { $0 + $1.duration } / 60.0
     }
 
     /// Consecutive days ending today that cleared the deep-work bar.

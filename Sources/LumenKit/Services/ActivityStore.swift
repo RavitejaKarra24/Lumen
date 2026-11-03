@@ -954,6 +954,58 @@ actor ActivityStore {
 
     // MARK: - Persistence
 
+    /// Flush and copy in one actor turn, with no suspension between files.
+    /// Compression happens later, so tracking can continue against the live store.
+    func copyBackupSnapshot(to destination: URL) throws {
+        try loadIfNeeded()
+        try flush()
+        try FileManager.default.copyItem(at: directory, to: destination)
+        let segmentFile = destination.appendingPathComponent(StoreFile.segments.rawValue)
+        if !FileManager.default.fileExists(atPath: segmentFile.path) {
+            try encoder.encode(segments).write(to: segmentFile, options: [.atomic])
+        }
+    }
+
+    /// Strict validation for restore. Unlike normal startup, this never repairs
+    /// or quarantines malformed files and never accepts an empty directory.
+    static func validateBackup(at directory: URL) throws {
+        let fm = FileManager.default
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let entries = try fm.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        for entry in entries {
+            let values = try entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw BackupError.invalidBackup
+            }
+        }
+        func decode<T: Decodable>(_ type: T.Type, _ name: String, required: Bool = false) throws {
+            let file = directory.appendingPathComponent(name)
+            guard required || fm.fileExists(atPath: file.path) else { return }
+            _ = try decoder.decode(type, from: Data(contentsOf: file))
+        }
+        try decode([ActivitySegment].self, StoreFile.segments.rawValue, required: true)
+        try decode([TagDefinition].self, StoreFile.tags.rawValue)
+        try decode([DailySnapshot].self, StoreFile.snapshots.rawValue)
+        try decode([ContentArtifact].self, StoreFile.contents.rawValue)
+        try decode([InsightRecord].self, StoreFile.insights.rawValue)
+        try decode([CreationGoal].self, StoreFile.goals.rawValue)
+        try decode([ProjectDefinition].self, StoreFile.projects.rawValue)
+        try decode([BehaviourWarning].self, StoreFile.warnings.rawValue)
+        try decode([FocusSession].self, StoreFile.focusSessions.rawValue)
+        try decode(Set<String>.self, StoreFile.dismissedInsights.rawValue)
+        try decode(Set<String>.self, StoreFile.mutedTopics.rawValue)
+        let meta = directory.appendingPathComponent(metaFileName)
+        if fm.fileExists(atPath: meta.path) {
+            let version = try decoder.decode(StoreMeta.self, from: Data(contentsOf: meta)).schemaVersion
+            guard version <= schemaVersion else {
+                throw StoreError.newerSchema(onDisk: version, supported: schemaVersion)
+            }
+        }
+    }
+
     private func persistSegments() { markDirty(.segments) }
     private func persistTags() { markDirty(.tags) }
     private func persistSnapshots() { markDirty(.snapshots) }

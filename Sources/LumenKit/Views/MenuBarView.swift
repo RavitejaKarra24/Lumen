@@ -62,6 +62,14 @@ struct MenuBarView: View {
 
         Divider()
 
+        if appState.backups.lastError != nil {
+            Button("Backup needs attention…") {
+                openWindow(id: "dashboard")
+                appState.selectedSidebar = .settings
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
+
         Button("Open Dashboard") {
             openWindow(id: "dashboard")
             NSApp.activate(ignoringOtherApps: true)

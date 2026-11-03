@@ -39,6 +39,16 @@ final class LumenAppDelegate: NSObject, NSApplicationDelegate {
 public enum LumenEntry {
     @MainActor
     public static func run() {
+        do {
+            try BackupRestore.applyIfPending()
+        } catch {
+            // Do not start writers against a failed or half-applied restore.
+            let alert = NSAlert()
+            alert.messageText = "Lumen could not restore the backup"
+            alert.informativeText = "\(error.localizedDescription) Your current data has been preserved. Resolve the pending restore in Application Support before reopening Lumen."
+            alert.runModal()
+            return
+        }
         LumenApp.main()
     }
 }
@@ -221,6 +231,13 @@ struct SidebarView: View {
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
+                }
+                if appState.backups.lastError != nil {
+                    Button("Backup needs attention") {
+                        appState.selectedSidebar = .settings
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

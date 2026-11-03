@@ -54,6 +54,7 @@ final class AppState {
     let behaviour = BehaviourEngine()
     let loginItem = LoginItemController()
     let noteDrafts = NoteDrafts()
+    let backups = BackupController()
 
     var selectedSidebar: SidebarItem = .today
     var selectedDay: Date = .now
@@ -120,6 +121,7 @@ final class AppState {
         intelligence.start()
         behaviour.start()
         startPeriodicRefresh()
+        backups.start()
         // didSet does not fire for values loaded during init, so retention is
         // applied explicitly here and then kept on a daily schedule.
         applyRetentionPolicy()

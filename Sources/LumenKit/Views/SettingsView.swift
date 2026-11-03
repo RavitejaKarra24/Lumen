@@ -188,6 +188,8 @@ struct SettingsView: View {
                 }
             }
 
+            BackupSettingsSection()
+
             Section("Data") {
                 Text("Activity is stored locally as JSON in your Application Support/Lumen folder.")
                     .font(.caption)

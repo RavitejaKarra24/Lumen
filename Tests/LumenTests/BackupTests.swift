@@ -37,37 +37,63 @@ func runBackupTests() async {
         check(!entries.contains { $0.hasSuffix(".partial") }, "no partial files published")
     }
 
-    await runTest("backup: retention removes only owned archives after a successful replacement") {
+    await runTest("backup: one current file holds all data, the replaced copy is kept as previous") {
         let root = TestSupport.makeStoreDirectory()
         let target = root.appendingPathComponent("drive")
         let live = root.appendingPathComponent("live")
         let fm = FileManager.default
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
-        let store = ActivityStore(directory: live)
-        let service = BackupService()
-        for day in 1...4 {
-            _ = try await service.createBackup(
-                store: store, destination: target, liveDirectory: live, retention: BackupRetention(recent: 2, days: 0),
-                now: TestSupport.date(2026, 10, day)
-            )
-        }
         let folder = target.appendingPathComponent(BackupService.folderName)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let legacy = folder.appendingPathComponent(
+            "Lumen-2026-11-03T18-19-45Z-DE7F17C9-8A71-4F89-85AD-235431ADDF75.zip")
+        try Data("old".utf8).write(to: legacy)
         let unrelated = folder.appendingPathComponent("my-backup.zip")
         try Data("keep".utf8).write(to: unrelated)
-        let newest = try await service.createBackup(
-            store: store, destination: target, liveDirectory: live, retention: BackupRetention(recent: 2, days: 0),
-            now: TestSupport.date(2026, 10, 5))
-        let archives = try fm.contentsOfDirectory(atPath: folder.path).filter { $0.hasPrefix("Lumen-") }
-        checkEqual(archives.count, 2, "keeps selected count")
-        check(fm.fileExists(atPath: unrelated.path), "unrelated archives preserved")
-        check(archives.contains(newest.lastPathComponent), "newest backup kept")
+
+        func notes(in archive: URL) throws -> [String] {
+            let extracted = root.appendingPathComponent("x-\(UUID().uuidString)")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-x", "-k", archive.path, extracted.path]
+            try process.run()
+            process.waitUntilExit()
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let data = try Data(contentsOf: extracted.appendingPathComponent("Lumen/segments.json"))
+            return try decoder.decode([ActivitySegment].self, from: data).sorted { $0.startAt < $1.startAt }.map(\.notes)
+        }
+
+        let store = ActivityStore(directory: live)
+        let service = BackupService()
+        let base = Date.now.addingTimeInterval(-3600)
+        try await store.insert(TestSupport.segment(from: base, to: base.addingTimeInterval(60), notes: "week 1"))
+        let first = try await service.createBackup(store: store, destination: target, liveDirectory: live)
+        checkEqual(first.lastPathComponent, BackupService.currentName, "stable file name")
+        check(!fm.fileExists(atPath: legacy.path), "timestamped 0.6 archives cleaned up")
+        check(fm.fileExists(atPath: unrelated.path), "unrelated files preserved")
+
+        try await store.insert(
+            TestSupport.segment(from: base.addingTimeInterval(120), to: base.addingTimeInterval(180), notes: "week 2"))
+        _ = try await service.createBackup(store: store, destination: target, liveDirectory: live)
+        try await store.insert(
+            TestSupport.segment(from: base.addingTimeInterval(240), to: base.addingTimeInterval(300), notes: "week 3"))
+        let latest = try await service.createBackup(store: store, destination: target, liveDirectory: live)
+
+        let names = Set(try fm.contentsOfDirectory(atPath: folder.path))
+        checkEqual(names, [BackupService.currentName, BackupService.previousName, "my-backup.zip"], "file count stays fixed")
+        checkEqual(try notes(in: latest), ["week 1", "week 2", "week 3"], "current backup has all data so far")
+        checkEqual(
+            try notes(in: folder.appendingPathComponent(BackupService.previousName)), ["week 1", "week 2"],
+            "previous backup is the copy it replaced")
+
         do {
             _ = try await service.createBackup(
                 store: store, destination: target.appendingPathComponent("missing"), liveDirectory: live)
             check(false, "missing destination rejected")
         } catch {
-            checkEqual(try fm.contentsOfDirectory(atPath: folder.path).count, 3, "failure leaves all existing copies")
+            checkEqual(Set(try fm.contentsOfDirectory(atPath: folder.path)), names, "failure leaves existing copies")
         }
     }
 
@@ -98,38 +124,27 @@ func runBackupTests() async {
             "missed days caught up")
     }
 
-    await runTest("backup: interval frequencies use elapsed time and survive a clock moved backwards") {
+    await runTest("backup: weekly waits seven days and survives a clock moved backwards") {
         let now = TestSupport.date(2026, 10, 28, 14)
-        check(!BackupController.isDue(lastBackup: now.addingTimeInterval(-3599), frequency: .hourly, now: now), "hourly waits")
-        check(BackupController.isDue(lastBackup: now.addingTimeInterval(-3600), frequency: .hourly, now: now), "hourly due")
         check(
-            !BackupController.isDue(lastBackup: now.addingTimeInterval(-2 * 3600), frequency: .every3Hours, now: now),
-            "3-hourly waits")
+            !BackupController.isDue(lastBackup: now.addingTimeInterval(-6 * 86400), frequency: .weekly, now: now),
+            "weekly waits")
         check(
-            BackupController.isDue(lastBackup: now.addingTimeInterval(-6 * 3600), frequency: .every6Hours, now: now),
-            "6-hourly due")
+            BackupController.isDue(lastBackup: now.addingTimeInterval(-7 * 86400), frequency: .weekly, now: now),
+            "weekly due")
         check(
-            BackupController.isDue(lastBackup: now.addingTimeInterval(86400), frequency: .every3Hours, now: now),
+            BackupController.isDue(lastBackup: now.addingTimeInterval(86400), frequency: .weekly, now: now),
             "future timestamp does not suspend backups")
     }
 
-    await runTest("backup: retention keeps recent copies plus one per day") {
-        func name(_ day: Int, _ hour: Int) -> String {
-            String(format: "Lumen-2026-10-%02dT%02d-00-00Z-%@.zip", day, hour, UUID().uuidString)
-        }
-        let names = (1...5).flatMap { day in [name(day, 9), name(day, 12), name(day, 18)] }
-        let newest = names.max()!
-        let removed = Set(BackupRetention(recent: 2, days: 3).namesToRemove(from: names, newest: newest))
-        let kept = names.filter { !removed.contains($0) }.sorted(by: >)
-        // Day 5's 18:00 and 12:00 are recent; days 4 and 3 each keep their newest.
-        checkEqual(kept.count, 4, "recent plus daily survivors")
-        check(kept.contains(newest), "newest kept")
-        check(kept.contains { $0.hasPrefix("Lumen-2026-10-04T18") }, "previous day's latest kept")
-        check(kept.contains { $0.hasPrefix("Lumen-2026-10-03T18") }, "third day's latest kept")
-        check(!kept.contains { $0.hasPrefix("Lumen-2026-10-02") }, "older days pruned")
-        check(
-            BackupRetention(recent: 0, days: 0).namesToRemove(from: names, newest: newest).count == names.count - 1,
-            "newest survives even a zero policy")
+    await runTest("backup: removed hourly settings fall back to weekly") {
+        let domain = "lumen-backup-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: domain)!
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set("every3Hours", forKey: "backup.frequency")
+        let controller = BackupController(
+            defaults: defaults, store: ActivityStore(directory: TestSupport.makeStoreDirectory()), gate: BlockingWorkGate())
+        checkEqual(controller.frequency, .weekly, "3-hourly migrates to weekly")
     }
 
     await runTest("backup: a hung destination times out and never stacks blocked threads") {
@@ -190,7 +205,7 @@ func runBackupTests() async {
         await controller.networkChanged(online: true)
         check(controller.lastBackupAt != nil, "reconnecting runs the due backup")
         check(!controller.isWaitingForNetwork, "no longer waiting")
-        checkEqual(controller.frequency, .every3Hours, "defaults to every 3 hours")
+        checkEqual(controller.frequency, .weekly, "defaults to weekly")
     }
 
     await runTest("backup: folder choice and success persist, errors keep the last successful date") {
@@ -211,12 +226,12 @@ func runBackupTests() async {
         let now = Date.now
         await controller.backUpIfDue(now: now)
         checkEqual(controller.lastBackupAt, now, "success timestamp recorded")
-        controller.frequency = .hourly
+        controller.frequency = .daily
         let reloaded = BackupController(defaults: defaults, store: store, gate: BlockingWorkGate())
         checkEqual(
             reloaded.folderURL?.resolvingSymlinksInPath().path, target.resolvingSymlinksInPath().path,
             "folder choice survives relaunch")
-        checkEqual(reloaded.frequency, .hourly, "frequency survives relaunch")
+        checkEqual(reloaded.frequency, .daily, "frequency survives relaunch")
         checkEqual(reloaded.lastBackupAt, now, "success survives relaunch")
         await controller.backUpIfDue(now: now.addingTimeInterval(120))
         checkEqual(

@@ -23,30 +23,6 @@ enum BackupError: LocalizedError {
     }
 }
 
-/// How many published archives survive pruning: the newest `recent` ones, plus
-/// the newest archive from each of the `days` most recent days that have one.
-/// Frequent backups therefore never push out older daily history.
-struct BackupRetention: Sendable, Equatable {
-    var recent: Int
-    var days: Int
-
-    static let standard = BackupRetention(recent: 6, days: 14)
-
-    /// Archive names are `Lumen-<UTC timestamp>-<UUID>.zip`, so names sort by
-    /// time and characters 6..<16 are the UTC day.
-    func namesToRemove(from names: [String], newest: String) -> [String] {
-        let sorted = names.sorted(by: >)
-        var keep: Set<String> = [newest]
-        keep.formUnion(sorted.prefix(max(0, recent)))
-        var seenDays = Set<String>()
-        for name in sorted where seenDays.count < max(0, days) {
-            let day = String(name.dropFirst(6).prefix(10))
-            if seenDays.insert(day).inserted { keep.insert(name) }
-        }
-        return sorted.filter { !keep.contains($0) }
-    }
-}
-
 /// Runs blocking file work against a cloud-synced folder on a dedicated thread.
 /// A wedged File Provider (Google Drive, iCloud) can block a syscall
 /// indefinitely; callers get `destinationUnresponsive` after the timeout
@@ -141,8 +117,17 @@ enum GoogleDriveLocator {
 /// Compression runs off the main actor against a private local snapshot. Only
 /// the finished, verified ZIP touches the destination, through a timeout gate,
 /// and it is published with a rename so Drive never uploads a partial backup.
+///
+/// The destination holds one up-to-date backup with all data so far, replaced
+/// in place on each run, plus the copy it replaced. The previous copy guards
+/// against damaged or wiped local data overwriting the only good backup.
 actor BackupService {
     static let folderName = "Lumen Backups"
+    static let currentName = "Lumen Backup.zip"
+    static let previousName = "Lumen Backup (previous).zip"
+    /// Timestamped archives written by Lumen 0.6; removed once a current
+    /// backup is in place, since it contains everything they did.
+    static let legacyPattern = #"^Lumen-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-[0-9A-Fa-f-]{36}\.zip$"#
     private var isBusy = false
     private let gate: BlockingWorkGate
     private let destinationTimeout: TimeInterval
@@ -166,8 +151,7 @@ actor BackupService {
     }
 
     func createBackup(
-        store: ActivityStore, destination: URL, liveDirectory: URL = ActivityStore.defaultDirectory,
-        retention: BackupRetention = .standard, now: Date = .now
+        store: ActivityStore, destination: URL, liveDirectory: URL = ActivityStore.defaultDirectory
     ) async throws -> URL {
         guard !isBusy else { throw BackupError.busy }
         isBusy = true
@@ -183,16 +167,13 @@ actor BackupService {
         try Self.run("/usr/bin/ditto", ["-c", "-k", "--keepParent", "--norsrc", snapshot.path, localArchive.path])
         try Self.run("/usr/bin/unzip", ["-tqq", localArchive.path])
         return try await gate.run(timeout: destinationTimeout) {
-            try Self.publish(
-                localArchive, to: destination, liveDirectory: liveDirectory, retention: retention, now: now)
+            try Self.publish(localArchive, to: destination, liveDirectory: liveDirectory)
         }
     }
 
     /// Everything that touches the destination folder. Blocking by design; only
     /// ever called through the gate.
-    private static func publish(
-        _ localArchive: URL, to destination: URL, liveDirectory: URL, retention: BackupRetention, now: Date
-    ) throws -> URL {
+    private static func publish(_ localArchive: URL, to destination: URL, liveDirectory: URL) throws -> URL {
         let fm = FileManager.default
         try validateDestination(destination, liveDirectory: liveDirectory)
         let folder = destination.appendingPathComponent(folderName, isDirectory: true)
@@ -201,18 +182,23 @@ actor BackupService {
         let resolved = folder.resolvingSymlinksInPath().standardizedFileURL.path
         guard resolved != live, !resolved.hasPrefix(live + "/") else { throw BackupError.invalidDestination }
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-        let date = ISO8601DateFormatter().string(from: now).replacingOccurrences(of: ":", with: "-")
-        let archive = folder.appendingPathComponent("Lumen-\(date)-\(UUID().uuidString).zip")
-        let partial = folder.appendingPathComponent(".\(archive.lastPathComponent).partial")
+        let current = folder.appendingPathComponent(currentName)
+        let previous = folder.appendingPathComponent(previousName)
+        let partial = folder.appendingPathComponent(".\(currentName).partial")
+        try? fm.removeItem(at: partial)
         defer { try? fm.removeItem(at: partial) }
         try fm.copyItem(at: localArchive, to: partial)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: partial.path)
         try run("/usr/bin/unzip", ["-tqq", partial.path])
-        try fm.moveItem(at: partial, to: archive)
-        // Retention only runs after publishing a verified new copy. An inability
-        // to prune must be reported too; it never removes the newest archive.
-        try prune(folder: folder, retention: retention, newest: archive)
-        return archive
+        // Only a verified new copy displaces the old one, and the old one is
+        // kept as the previous backup rather than deleted.
+        if fm.fileExists(atPath: current.path) {
+            if fm.fileExists(atPath: previous.path) { try fm.removeItem(at: previous) }
+            try fm.moveItem(at: current, to: previous)
+        }
+        try fm.moveItem(at: partial, to: current)
+        try removeLegacyArchives(in: folder)
+        return current
     }
 
     private static func run(_ executable: String, _ arguments: [String]) throws {
@@ -227,17 +213,12 @@ actor BackupService {
         guard process.terminationStatus == 0 else { throw BackupError.archiveFailed }
     }
 
-    private static func prune(folder: URL, retention: BackupRetention, newest: URL) throws {
+    private static func removeLegacyArchives(in folder: URL) throws {
         let fm = FileManager.default
-        let pattern = #"^Lumen-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-[0-9A-Fa-f-]{36}\.zip$"#
         let entries = try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey])
-        let archives = try entries.filter {
-            guard $0.lastPathComponent.range(of: pattern, options: .regularExpression) != nil else { return false }
-            return try $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
-        }
-        let remove = Set(retention.namesToRemove(from: archives.map(\.lastPathComponent), newest: newest.lastPathComponent))
-        for archive in archives where remove.contains(archive.lastPathComponent) {
-            try fm.removeItem(at: archive)
+        for entry in entries where entry.lastPathComponent.range(of: legacyPattern, options: .regularExpression) != nil {
+            guard try entry.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { continue }
+            try fm.removeItem(at: entry)
         }
     }
 }

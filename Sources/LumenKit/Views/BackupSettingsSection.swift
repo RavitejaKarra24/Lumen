@@ -8,7 +8,7 @@ struct BackupSettingsSection: View {
 
         Section("Google Drive Backup") {
             Text(
-                "Lumen saves a compressed copy of your data into your Google Drive folder, and Google Drive for desktop uploads it to your account whenever you’re online. Live data stays on this Mac."
+                "Lumen keeps one up-to-date backup of all your data in your Google Drive folder, and Google Drive for desktop uploads it to your account whenever you’re online. Live data stays on this Mac."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -59,7 +59,7 @@ struct BackupSettingsSection: View {
             }
 
             Text(
-                "Keeps the 6 newest backups plus one per day for the last 14 days. Missed backups run on the next launch, after wake, or as soon as the connection returns. Backups include activity, tags, reports, goals, and captured content; preferences are stored separately."
+                "Each backup replaces \(BackupService.currentName) with everything recorded so far; the copy it replaces is kept as \(BackupService.previousName). Missed backups run on the next launch, after wake, or as soon as the connection returns. Backups include activity, tags, reports, goals, and captured content; preferences are stored separately."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -85,7 +85,7 @@ struct BackupSettingsSection: View {
                 Button("Choose Folder…") { backups.chooseFolder() }
                 Button("Back Up Now") { Task { await backups.backUpNow() } }
                     .disabled(backups.folderURL == nil)
-                Button("Show Backups") { backups.revealFolder() }
+                Button("Show Backup") { backups.revealFolder() }
                     .disabled(backups.folderURL == nil)
             }
             .disabled(backups.isBusy || backups.restorePending)

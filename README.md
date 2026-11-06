@@ -101,7 +101,7 @@ That is everything. Lumen does not install background helpers, and it does not c
 - **Content capture makes network requests.** Lumen's Intelligence feature re-fetches the web pages you visited (and YouTube caption tracks) so it can summarise what you were reading. Those requests go to the websites themselves. It is **on by default** — turn off **Auto-capture page content & transcripts** in **Settings → Intelligence** to stop automatic fetching. Everything else keeps working with it off.
 - Lumen does not take screenshots, record what you type, or read the contents of your documents.
 - **Settings → Data** can limit how long raw activity is kept. Generated reports are never deleted automatically.
-- Optional backups copy your recorded data into your Google Drive folder (or another folder you choose). Google Drive for desktop then uploads them to your account.
+- Optional backups copy your recorded data into your Google Drive folder (or another folder you choose). Google Drive for desktop then uploads it to your account.
 
 ## Back up to Google Drive
 
@@ -112,17 +112,17 @@ Lumen can keep a copy of your data in your Google Drive. It works through **[Goo
 
 That's all. Lumen makes the first backup straight away and creates a **Lumen Backups** folder in your My Drive.
 
-- **How often:** every 3 hours by default. You can change it to every hour, every 6 hours, or once a day.
+- **How often:** once a week by default. You can change it to once a day.
 - **Only while online:** automatic backups wait for an internet connection and start as soon as one returns. Missed backups also run on the next launch or after wake. **Back Up Now** runs one immediately, even when offline; Drive uploads it once you reconnect.
-- **History:** Lumen keeps the 6 newest backups plus one per day for the last 14 days. Older copies are removed only after a new one has been saved and verified.
+- **One file, always complete:** the folder holds a single **Lumen Backup.zip** with everything recorded since you started using Lumen. Each backup replaces it with a fresh complete copy, so the folder never fills up. The copy it replaces is kept as **Lumen Backup (previous).zip**, so a problem with your Mac's data can never overwrite your only good backup. A new copy replaces the old one only after it has been saved and verified. Timestamped backups from Lumen 0.6 are removed the first time this runs.
 - **Status:** Settings shows the last and next backup. Problems stay visible in Settings, the sidebar, and the menu bar until a later backup succeeds. If Google Drive stops responding, Lumen gives up after a few minutes instead of hanging, and tries again later.
-- **Upload progress:** Lumen saves each ZIP into your Drive folder, then Google Drive for desktop uploads it. Open Drive for desktop to see upload progress. Syncing must not be paused there.
+- **Upload progress:** Lumen saves the ZIP into your Drive folder, then Google Drive for desktop uploads it. Open Drive for desktop to see upload progress. Syncing must not be paused there.
 
-Each ZIP contains activity, tags, saved reports, goals, and captured content. Your live data stays in Application Support; do not move it into Drive. Lumen takes a snapshot before compressing, so tracking carries on during a backup.
+The backup contains activity, tags, saved reports, goals, and captured content. Your live data stays in Application Support; do not move it into Drive. Lumen takes a snapshot before compressing, so tracking carries on during a backup.
 
 Backups are **not encrypted**. They contain private website history, window titles, and captured content, so keep them in a private Drive folder. Preferences are not included. CSV exports do not replace these backups.
 
-To restore, unzip a backup, click **Restore…**, and select the extracted **Lumen** folder. After you confirm, quit and reopen Lumen. It checks the backup before replacing anything and keeps your current data beside it as **Lumen Before Restore…**. Preferences stay as they are.
+To restore, unzip **Lumen Backup.zip** (or the previous copy), click **Restore…**, and select the extracted **Lumen** folder. After you confirm, quit and reopen Lumen. It checks the backup before replacing anything and keeps your current data beside it as **Lumen Before Restore…**. Preferences stay as they are.
 
 ## If something looks wrong
 

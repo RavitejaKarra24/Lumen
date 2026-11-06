@@ -4,35 +4,29 @@ import Network
 import Observation
 
 enum BackupFrequency: String, CaseIterable, Identifiable, Sendable {
-    case hourly
-    case every3Hours
-    case every6Hours
     case daily
+    case weekly
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .hourly: "Every hour"
-        case .every3Hours: "Every 3 hours"
-        case .every6Hours: "Every 6 hours"
         case .daily: "Once a day"
+        case .weekly: "Once a week"
         }
     }
 
     var interval: TimeInterval {
         switch self {
-        case .hourly: 3600
-        case .every3Hours: 3 * 3600
-        case .every6Hours: 6 * 3600
         case .daily: 86400
+        case .weekly: 7 * 86400
         }
     }
 }
 
 /// Reports whether the Mac has a usable network path. Backups land in a local
 /// Drive for desktop folder, but automatic runs wait for a connection so each
-/// copy can upload promptly instead of queueing stale snapshots offline.
+/// copy can upload promptly instead of sitting stale offline.
 final class NetworkStatusMonitor: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "lumen.backup.network")
@@ -110,7 +104,8 @@ final class BackupController {
         self.gate = gate
         service = BackupService(gate: gate, destinationTimeout: destinationTimeout)
         automaticEnabled = defaults.bool(forKey: Keys.automatic)
-        frequency = defaults.string(forKey: Keys.frequency).flatMap(BackupFrequency.init(rawValue:)) ?? .every3Hours
+        // Hourly choices from Lumen 0.6 no longer exist and fall back to weekly.
+        frequency = defaults.string(forKey: Keys.frequency).flatMap(BackupFrequency.init(rawValue:)) ?? .weekly
         lastBackupAt = defaults.object(forKey: Keys.lastSuccess) as? Date
         lastError = defaults.string(forKey: Keys.lastError)
         restorePending = FileManager.default.fileExists(
@@ -140,8 +135,8 @@ final class BackupController {
         driveAccounts = GoogleDriveLocator.accounts()
     }
 
-    /// Hourly frequencies use elapsed time; daily uses the local calendar day,
-    /// so a missed day is caught up on the next launch or after wake.
+    /// Weekly uses elapsed time; daily uses the local calendar day. Either way a
+    /// missed backup is caught up on the next launch or after wake.
     static func isDue(
         lastBackup: Date?, frequency: BackupFrequency, now: Date = .now, calendar: Calendar = .current
     ) -> Bool {
@@ -228,7 +223,7 @@ final class BackupController {
         lastAttemptAt = now
         defer { isBusy = false }
         do {
-            _ = try await service.createBackup(store: store, destination: folderURL, now: now)
+            _ = try await service.createBackup(store: store, destination: folderURL)
             lastBackupAt = now
             defaults.set(now, forKey: Keys.lastSuccess)
             clearError()
